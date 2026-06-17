@@ -67,6 +67,7 @@ function getMemberName(userId: string): string {
 
 function validateAndCheckConflicts(
   mergedRequests: CreateBookingRequest[],
+  excludeUserId?: string,
 ): {
   totalCredits: number
   conflicts: BookingConflictInfo[]
@@ -95,7 +96,7 @@ function validateAndCheckConflicts(
       req.roomId,
       req.startTime,
       req.endTime,
-    )
+    ).filter((b) => !excludeUserId || b.userId !== excludeUserId)
 
     if (existingConflicts.length > 0) {
       for (const c of existingConflicts) {
@@ -245,7 +246,7 @@ export const BookingService = {
             )
           }
 
-          const { conflicts: finalConflicts } = validateAndCheckConflicts(mergedRequests)
+          const { conflicts: finalConflicts } = validateAndCheckConflicts(mergedRequests, userId)
           if (finalConflicts.length > 0) {
             rollback()
             throw new BookingConflictError(finalConflicts)
@@ -311,7 +312,7 @@ export const BookingService = {
             )
           }
 
-          const { conflicts: finalConflictsSingle } = validateAndCheckConflicts([request])
+          const { conflicts: finalConflictsSingle } = validateAndCheckConflicts([request], userId)
           if (finalConflictsSingle.length > 0) {
             rollback()
             throw new BookingConflictError(finalConflictsSingle)

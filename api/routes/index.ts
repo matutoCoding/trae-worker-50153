@@ -4,6 +4,7 @@ import { RoomController } from '../controllers/RoomController.js'
 import { BookingController } from '../controllers/BookingController.js'
 import { FamilyController } from '../controllers/FamilyController.js'
 import { StatisticsController } from '../controllers/StatisticsController.js'
+import { TestController } from '../controllers/TestController.js'
 
 const VALID_USER_IDS = ['user-1', 'user-2', 'user-3']
 
@@ -54,7 +55,9 @@ router.delete('/family/members/:id', authMiddleware, FamilyController.removeMemb
 router.get('/family/credits/transactions', authMiddleware, FamilyController.getTransactions)
 router.post('/family/credits/recharge', authMiddleware, FamilyController.rechargeCredits)
 
-router.get('/statistics/duration', authMiddleware, StatisticsController.getDurationStats)
+router.get('/statistics/duration', authMiddleware, StatisticsController.getDuration)
 router.get('/statistics/ranking', authMiddleware, StatisticsController.getRanking)
+
+router.get('/test/concurrency', authMiddleware, TestController.runConcurrencyTests)
 
 export default router

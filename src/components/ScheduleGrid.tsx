@@ -43,6 +43,7 @@ export default function ScheduleGrid() {
   const [bookingLoading, setBookingLoading] = useState(false);
   const [bookingError, setBookingError] = useState<string | null>(null);
   const [conflictInfos, setConflictInfos] = useState<BookingConflictInfo[]>([]);
+  const [noRetrySlots, setNoRetrySlots] = useState(false);
   const [showDrawer, setShowDrawer] = useState(false);
 
   const weekDates = useMemo(() => getWeekDates(weekStart), [weekStart]);
@@ -144,6 +145,7 @@ export default function ScheduleGrid() {
   const handleConfirm = async () => {
     setBookingError(null);
     setConflictInfos([]);
+    setNoRetrySlots(false);
     setBookingLoading(true);
     try {
       const batchBookings: { roomId: string; startTime: string; endTime: string }[] = [];
@@ -223,13 +225,18 @@ export default function ScheduleGrid() {
   const handleRemoveConflictsAndRetry = async () => {
     const toRemove = getSlotsOverlappingConflicts();
     if (toRemove.length === 0) return;
+
+    if (toRemove.length >= selectedSlots.length) {
+      setNoRetrySlots(true);
+      setBookingError('清除冲突后已无可预约时段，请关闭后重新选择其他时段');
+      return;
+    }
+
     removeSelectedSlots(toRemove);
     setConflictInfos([]);
+    setNoRetrySlots(false);
     setBookingError(null);
-    const remaining = selectedSlots.filter(
-      (s) => !toRemove.some((r) => r.roomId === s.roomId && r.date === s.date && r.startTime === s.startTime)
-    );
-    if (remaining.length === 0) return;
+
     setTimeout(() => handleConfirm(), 50);
   };
 
@@ -429,14 +436,21 @@ export default function ScheduleGrid() {
                 <div className="space-y-3">
                   <div className="flex items-center justify-between">
                     <p className="text-sm font-semibold text-gray-900">冲突时段详情</p>
-                    <button
-                      onClick={handleRemoveConflictsAndRetry}
-                      disabled={bookingLoading}
-                      className="flex items-center gap-1 text-xs px-3 py-1.5 rounded-lg bg-amber-100 text-amber-800 font-medium hover:bg-amber-200 transition-colors disabled:opacity-50"
-                    >
-                      <RefreshCw className="w-3 h-3" />
-                      清除冲突时段并重试
-                    </button>
+                    {!noRetrySlots && (
+                      <button
+                        onClick={handleRemoveConflictsAndRetry}
+                        disabled={bookingLoading}
+                        className="flex items-center gap-1 text-xs px-3 py-1.5 rounded-lg bg-amber-100 text-amber-800 font-medium hover:bg-amber-200 transition-colors disabled:opacity-50"
+                      >
+                        <RefreshCw className="w-3 h-3" />
+                        清除冲突时段并重试
+                      </button>
+                    )}
+                    {noRetrySlots && (
+                      <span className="text-xs text-gray-400 font-medium">
+                        无可重试时段
+                      </span>
+                    )}
                   </div>
                   <div className="space-y-2">
                     {conflictInfos.map((c, idx) => {

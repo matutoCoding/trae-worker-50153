@@ -14,12 +14,16 @@ export class LockQueueFullError extends Error {
   }
 }
 
-interface LockEntry {
+interface WaiterEntry {
   promise: Promise<void>
   resolve: () => void
   reject: (err: Error) => void
   timeout: NodeJS.Timeout
-  acquired: boolean
+}
+
+interface LockState {
+  locked: boolean
+  waiters: WaiterEntry[]
 }
 
 interface CallerLockState {
@@ -56,7 +60,16 @@ function withRootContext<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 export class LockManager {
-  private locks: Map<string, LockEntry[]> = new Map()
+  private locks: Map<string, LockState> = new Map()
+
+  private getOrCreateLock(key: string): LockState {
+    let state = this.locks.get(key)
+    if (!state) {
+      state = { locked: false, waiters: [] }
+      this.locks.set(key, state)
+    }
+    return state
+  }
 
   async acquire(
     key: string,
@@ -80,20 +93,27 @@ export class LockManager {
       }
     }
 
-    const waiting = this.locks.get(key) ?? []
+    const lock = this.getOrCreateLock(key)
 
-    if (waiting.length >= maxQueueLength) {
+    if (lock.waiters.length >= maxQueueLength) {
       throw new LockQueueFullError(
         `系统繁忙，请稍后再试。当前请求排队人数已达上限（${maxQueueLength}人）`
       )
     }
 
-    const entry: LockEntry = {
+    if (!lock.locked) {
+      lock.locked = true
+      state.held.add(key)
+      state.reentryCounts.set(key, 1)
+
+      return () => this.release(key)
+    }
+
+    const entry: WaiterEntry = {
       promise: null as unknown as Promise<void>,
       resolve: null as unknown as () => void,
       reject: null as unknown as (err: Error) => void,
       timeout: null as unknown as NodeJS.Timeout,
-      acquired: false,
     }
 
     entry.promise = new Promise<void>((resolve, reject) => {
@@ -102,40 +122,37 @@ export class LockManager {
     })
 
     entry.timeout = setTimeout(() => {
-      this.removeLock(key, entry, false)
-      if (!entry.acquired) {
-        entry.reject(
-          new LockTimeoutError(
-            `等待超时（${timeoutMs / 1000}秒）。当前时段预约人数较多，请稍后重试或选择其他时段`
-          )
-        )
+      const idx = lock.waiters.indexOf(entry)
+      if (idx !== -1) {
+        lock.waiters.splice(idx, 1)
       }
+      if (lock.waiters.length === 0 && !lock.locked) {
+        this.locks.delete(key)
+      }
+      entry.reject(
+        new LockTimeoutError(
+          `等待超时（${timeoutMs / 1000}秒）。当前时段预约人数较多，请稍后重试或选择其他时段`
+        )
+      )
     }, timeoutMs)
 
-    waiting.push(entry)
-    this.locks.set(key, waiting)
+    lock.waiters.push(entry)
 
-    if (waiting.length > 1) {
-      const prevEntry = waiting[waiting.length - 2]
-      try {
-        await prevEntry.promise
-      } catch {
-        this.removeLock(key, entry, false)
-        throw new LockTimeoutError(
-          '排队等待过程中发生错误，请稍后重试'
-        )
-      }
+    try {
+      await entry.promise
+    } catch (err) {
+      clearTimeout(entry.timeout)
+      throw err
     }
 
-    entry.acquired = true
     clearTimeout(entry.timeout)
     state.held.add(key)
     state.reentryCounts.set(key, 1)
 
-    return () => this.release(key, entry)
+    return () => this.release(key)
   }
 
-  private release(key: string, entry: LockEntry): void {
+  private release(key: string): void {
     const state = getState()
     const count = state.reentryCounts.get(key) ?? 0
 
@@ -146,37 +163,29 @@ export class LockManager {
 
     state.reentryCounts.delete(key)
     state.held.delete(key)
-    this.removeLock(key, entry, true)
-  }
 
-  private removeLock(key: string, entry: LockEntry, shouldResolve: boolean): void {
-    const waiting = this.locks.get(key)
-    if (!waiting) return
+    const lock = this.locks.get(key)
+    if (!lock) return
 
-    const index = waiting.findIndex((e) => e === entry)
-    if (index === -1) return
-
-    clearTimeout(entry.timeout)
-
-    waiting.splice(index, 1)
-
-    if (waiting.length === 0) {
-      this.locks.delete(key)
-    }
-
-    if (shouldResolve && entry.acquired) {
-      entry.resolve()
+    if (lock.waiters.length > 0) {
+      const next = lock.waiters.shift()!
+      next.resolve()
+    } else {
+      lock.locked = false
+      if (lock.waiters.length === 0) {
+        this.locks.delete(key)
+      }
     }
   }
 
   isLocked(key: string): boolean {
-    const waiting = this.locks.get(key)
-    return waiting !== undefined && waiting.length > 0
+    const lock = this.locks.get(key)
+    return lock ? lock.locked : false
   }
 
   getQueueLength(key: string): number {
-    const waiting = this.locks.get(key)
-    return waiting?.length ?? 0
+    const lock = this.locks.get(key)
+    return lock?.waiters.length ?? 0
   }
 
   async withLock<T>(
