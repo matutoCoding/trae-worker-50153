@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
+
 export class LockTimeoutError extends Error {
   constructor(message: string) {
     super(message)
@@ -20,8 +22,38 @@ interface LockEntry {
   acquired: boolean
 }
 
+interface CallerLockState {
+  held: Set<string>
+  reentryCounts: Map<string, number>
+}
+
 const DEFAULT_TIMEOUT = 15000
 const DEFAULT_MAX_QUEUE_LENGTH = 5
+
+const lockContext = new AsyncLocalStorage<CallerLockState>()
+
+function getState(): CallerLockState {
+  return (
+    lockContext.getStore() ?? {
+      held: new Set<string>(),
+      reentryCounts: new Map<string, number>(),
+    }
+  )
+}
+
+export function isLockHeldByCurrentCaller(key: string): boolean {
+  return getState().held.has(key)
+}
+
+function withRootContext<T>(fn: () => Promise<T>): Promise<T> {
+  if (lockContext.getStore()) {
+    return fn()
+  }
+  return lockContext.run(
+    { held: new Set<string>(), reentryCounts: new Map<string, number>() },
+    fn
+  )
+}
 
 export class LockManager {
   private locks: Map<string, LockEntry[]> = new Map()
@@ -31,6 +63,23 @@ export class LockManager {
     timeoutMs: number = DEFAULT_TIMEOUT,
     maxQueueLength: number = DEFAULT_MAX_QUEUE_LENGTH
   ): Promise<() => void> {
+    const state = getState()
+
+    if (state.held.has(key)) {
+      const current = state.reentryCounts.get(key) ?? 0
+      state.reentryCounts.set(key, current + 1)
+
+      return () => {
+        const s = getState()
+        const c = s.reentryCounts.get(key) ?? 0
+        if (c > 1) {
+          s.reentryCounts.set(key, c - 1)
+        } else {
+          s.reentryCounts.delete(key)
+        }
+      }
+    }
+
     const waiting = this.locks.get(key) ?? []
 
     if (waiting.length >= maxQueueLength) {
@@ -80,11 +129,23 @@ export class LockManager {
 
     entry.acquired = true
     clearTimeout(entry.timeout)
+    state.held.add(key)
+    state.reentryCounts.set(key, 1)
 
     return () => this.release(key, entry)
   }
 
   private release(key: string, entry: LockEntry): void {
+    const state = getState()
+    const count = state.reentryCounts.get(key) ?? 0
+
+    if (count > 1) {
+      state.reentryCounts.set(key, count - 1)
+      return
+    }
+
+    state.reentryCounts.delete(key)
+    state.held.delete(key)
     this.removeLock(key, entry, true)
   }
 
@@ -124,12 +185,14 @@ export class LockManager {
     timeoutMs?: number,
     maxQueueLength?: number
   ): Promise<T> {
-    const release = await this.acquire(key, timeoutMs, maxQueueLength)
-    try {
-      return await fn()
-    } finally {
-      release()
-    }
+    return withRootContext(async () => {
+      const release = await this.acquire(key, timeoutMs, maxQueueLength)
+      try {
+        return await fn()
+      } finally {
+        release()
+      }
+    })
   }
 
   async runWithLock<T>(
@@ -139,6 +202,49 @@ export class LockManager {
     maxQueueLength?: number
   ): Promise<T> {
     return this.withLock(key, fn, timeoutMs, maxQueueLength)
+  }
+
+  async acquireMulti(
+    keys: string[],
+    timeoutMsPerLock: number = DEFAULT_TIMEOUT,
+    maxQueueLength: number = DEFAULT_MAX_QUEUE_LENGTH
+  ): Promise<() => void> {
+    const sortedKeys = [...keys].sort()
+    const releases: (() => void)[] = []
+
+    try {
+      for (const key of sortedKeys) {
+        const release = await this.acquire(key, timeoutMsPerLock, maxQueueLength)
+        releases.push(release)
+      }
+    } catch (error) {
+      for (let i = releases.length - 1; i >= 0; i--) {
+        try { releases[i]() } catch { /* ignore */ }
+      }
+      throw error
+    }
+
+    return () => {
+      for (let i = releases.length - 1; i >= 0; i--) {
+        try { releases[i]() } catch { /* ignore */ }
+      }
+    }
+  }
+
+  async runWithMultiLock<T>(
+    keys: string[],
+    fn: () => Promise<T> | T,
+    timeoutMsPerLock?: number,
+    maxQueueLength?: number
+  ): Promise<T> {
+    return withRootContext(async () => {
+      const release = await this.acquireMulti(keys, timeoutMsPerLock, maxQueueLength)
+      try {
+        return await fn()
+      } finally {
+        release()
+      }
+    })
   }
 }
 

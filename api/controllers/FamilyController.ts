@@ -1,6 +1,6 @@
 import type { Request, Response } from 'express'
 import { FamilyService } from '../services/FamilyService.js'
-import { CreditService } from '../services/CreditService.js'
+import { CreditService, CreditInsufficientError } from '../services/CreditService.js'
 import { LockTimeoutError, LockQueueFullError } from '../utils/LockManager.js'
 import type { AddMemberRequest } from '../../shared/types.js'
 
@@ -18,6 +18,16 @@ function handleError(res: Response, error: unknown, defaultMessage: string): voi
       success: false,
       message: error.message,
       code: 'LOCK_QUEUE_FULL',
+    })
+    return
+  }
+  if (error instanceof CreditInsufficientError) {
+    res.status(402).json({
+      success: false,
+      message: error.message,
+      code: 'CREDIT_INSUFFICIENT',
+      currentBalance: error.currentBalance,
+      requiredAmount: error.requiredAmount,
     })
     return
   }

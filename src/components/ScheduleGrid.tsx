@@ -1,8 +1,8 @@
 import { useState, useMemo, useEffect } from 'react';
-import { ChevronLeft, ChevronRight, X, Check, Clock, AlertCircle } from 'lucide-react';
+import { ChevronLeft, ChevronRight, X, Check, Clock, AlertCircle, User, MapPin, RefreshCw } from 'lucide-react';
 import { useAppStore } from '@/stores/useAppStore';
-import { api } from '@/lib/api';
-import type { Room, ScheduleSlot } from '@/../shared/types';
+import { api, type ApiError } from '@/lib/api';
+import type { Room, ScheduleSlot, BookingConflictInfo } from '@/../shared/types';
 
 const TIME_START = 8;
 const TIME_END = 22;
@@ -36,12 +36,13 @@ function getMonday(date: Date): Date {
 const weekDayNames = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
 
 export default function ScheduleGrid() {
-  const { rooms, selectedSlots, toggleSelectedSlot, clearSelectedSlots, user } = useAppStore();
+  const { rooms, selectedSlots, toggleSelectedSlot, clearSelectedSlots, user, removeSelectedSlots } = useAppStore();
   const [weekStart, setWeekStart] = useState<Date>(getMonday(new Date()));
   const [scheduleData, setScheduleData] = useState<Map<string, ScheduleSlot>>(new Map());
   const [loading, setLoading] = useState(false);
   const [bookingLoading, setBookingLoading] = useState(false);
   const [bookingError, setBookingError] = useState<string | null>(null);
+  const [conflictInfos, setConflictInfos] = useState<BookingConflictInfo[]>([]);
   const [showDrawer, setShowDrawer] = useState(false);
 
   const weekDates = useMemo(() => getWeekDates(weekStart), [weekStart]);
@@ -142,6 +143,7 @@ export default function ScheduleGrid() {
 
   const handleConfirm = async () => {
     setBookingError(null);
+    setConflictInfos([]);
     setBookingLoading(true);
     try {
       const batchBookings: { roomId: string; startTime: string; endTime: string }[] = [];
@@ -178,19 +180,57 @@ export default function ScheduleGrid() {
       setShowDrawer(false);
       window.location.reload();
     } catch (e) {
+      const apiErr = e as ApiError;
       let errorMessage = '预约失败，请稍后重试';
-      if (e instanceof Error) {
-        errorMessage = e.message;
-        if (errorMessage.includes('超时') || errorMessage.includes('LOCK_TIMEOUT')) {
-          errorMessage = '预约等待超时，当前时段较热门，请稍后重试或选择其他时段';
-        } else if (errorMessage.includes('繁忙') || errorMessage.includes('LOCK_QUEUE_FULL')) {
-          errorMessage = '系统繁忙，当前排队人数较多，请稍后再试';
+
+      if (apiErr.code === 'LOCK_TIMEOUT') {
+        errorMessage = '预约等待超时，当前时段较热门，请稍后重试或选择其他时段';
+      } else if (apiErr.code === 'LOCK_QUEUE_FULL') {
+        errorMessage = '系统繁忙，当前排队人数较多，请稍后再试';
+      } else if (apiErr.code === 'BOOKING_CONFLICT') {
+        errorMessage = '部分时段已被他人抢先预约，请查看下方详情后调整选择';
+        if (apiErr.conflicts && apiErr.conflicts.length > 0) {
+          setConflictInfos(apiErr.conflicts);
         }
+      } else if (apiErr.code === 'CREDIT_INSUFFICIENT') {
+        const cur = apiErr.currentBalance ?? 0;
+        const req = apiErr.requiredAmount ?? 0;
+        errorMessage = `家庭额度不足。当前剩余 ${cur} 点，本次需要 ${req} 点，请先充值`;
+      } else if (apiErr instanceof Error) {
+        errorMessage = apiErr.message;
       }
+
       setBookingError(errorMessage);
     } finally {
       setBookingLoading(false);
     }
+  };
+
+  const getSlotsOverlappingConflicts = () => {
+    if (conflictInfos.length === 0) return [];
+    return selectedSlots.filter((slot) => {
+      const slotStart = new Date(`${slot.date}T${slot.startTime}:00`).getTime();
+      const slotEnd = new Date(`${slot.date}T${slot.endTime}:00`).getTime();
+      return conflictInfos.some((c) => {
+        if (c.roomId !== slot.roomId) return false;
+        const cStart = new Date(c.startTime).getTime();
+        const cEnd = new Date(c.endTime).getTime();
+        return slotStart < cEnd && slotEnd > cStart;
+      });
+    });
+  };
+
+  const handleRemoveConflictsAndRetry = async () => {
+    const toRemove = getSlotsOverlappingConflicts();
+    if (toRemove.length === 0) return;
+    removeSelectedSlots(toRemove);
+    setConflictInfos([]);
+    setBookingError(null);
+    const remaining = selectedSlots.filter(
+      (s) => !toRemove.some((r) => r.roomId === s.roomId && r.date === s.date && r.startTime === s.startTime)
+    );
+    if (remaining.length === 0) return;
+    setTimeout(() => handleConfirm(), 50);
   };
 
   return (
@@ -379,9 +419,67 @@ export default function ScheduleGrid() {
                 );
               })}
               {bookingError && (
-                <div className="flex items-center gap-2 p-3 bg-red-50 rounded-lg text-red-700 text-sm">
-                  <AlertCircle className="w-4 h-4" />
-                  {bookingError}
+                <div className="flex items-start gap-2 p-3 bg-red-50 rounded-lg text-red-700 text-sm">
+                  <AlertCircle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                  <div className="flex-1">{bookingError}</div>
+                </div>
+              )}
+
+              {conflictInfos.length > 0 && (
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between">
+                    <p className="text-sm font-semibold text-gray-900">冲突时段详情</p>
+                    <button
+                      onClick={handleRemoveConflictsAndRetry}
+                      disabled={bookingLoading}
+                      className="flex items-center gap-1 text-xs px-3 py-1.5 rounded-lg bg-amber-100 text-amber-800 font-medium hover:bg-amber-200 transition-colors disabled:opacity-50"
+                    >
+                      <RefreshCw className="w-3 h-3" />
+                      清除冲突时段并重试
+                    </button>
+                  </div>
+                  <div className="space-y-2">
+                    {conflictInfos.map((c, idx) => {
+                      const room = rooms.find((r) => r.id === c.roomId);
+                      const startDt = new Date(c.startTime);
+                      const endDt = new Date(c.endTime);
+                      const month = startDt.getMonth() + 1;
+                      const day = startDt.getDate();
+                      const fmt = (d: Date) =>
+                        `${d.getHours().toString().padStart(2, '0')}:${d
+                          .getMinutes()
+                          .toString()
+                          .padStart(2, '0')}`;
+                      return (
+                        <div
+                          key={idx}
+                          className="bg-red-50/60 border border-red-100 rounded-xl p-3"
+                        >
+                          <div className="flex items-center gap-2 mb-2">
+                            <MapPin className="w-3.5 h-3.5 text-red-600" />
+                            <span className="text-sm font-semibold text-gray-900">
+                              {room?.name ?? '未知琴房'}
+                            </span>
+                            <span className="text-xs text-gray-500 ml-auto">
+                              {month}月{day}日
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-2 text-sm text-gray-600 mb-2">
+                            <Clock className="w-3.5 h-3.5 text-gray-500" />
+                            <span>
+                              {fmt(startDt)} - {fmt(endDt)}
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-2 text-xs text-red-700 bg-red-100/60 rounded-lg px-2.5 py-1.5 inline-flex">
+                            <User className="w-3 h-3" />
+                            <span>
+                              被 {c.conflictUserName ?? '其他用户'} 占用
+                            </span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
                 </div>
               )}
             </div>

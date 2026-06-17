@@ -1,7 +1,7 @@
 import { BookingRepository } from '../repositories/BookingRepository.js'
 import { RoomRepository } from '../repositories/RoomRepository.js'
 import { FamilyRepository } from '../repositories/FamilyRepository.js'
-import { CreditService } from './CreditService.js'
+import { CreditService, CreditInsufficientError } from './CreditService.js'
 import { lockManager } from '../utils/LockManager.js'
 import { beginTransaction, commit, rollback } from '../db/dbUtils.js'
 import type {
@@ -9,7 +9,9 @@ import type {
   CreateBookingRequest,
   CreateBatchBookingRequest,
   ScheduleSlot,
+  BookingConflictInfo,
 } from '../../shared/types.js'
+import { BookingConflictError } from '../../shared/types.js'
 
 function calculateDurationMinutes(startTime: string, endTime: string): number {
   const start = new Date(startTime).getTime()
@@ -26,6 +28,172 @@ function formatDate(date: Date): string {
   return date.toISOString().split('T')[0]
 }
 
+function mergeAdjacentByRoom(
+  bookings: CreateBookingRequest[]
+): CreateBookingRequest[] {
+  if (bookings.length === 0) return []
+
+  const byRoom = new Map<string, CreateBookingRequest[]>()
+  for (const b of bookings) {
+    const arr = byRoom.get(b.roomId) ?? []
+    arr.push(b)
+    byRoom.set(b.roomId, arr)
+  }
+
+  const result: CreateBookingRequest[] = []
+  for (const [roomId, reqs] of byRoom) {
+    const sorted = [...reqs].sort((a, b) => a.startTime.localeCompare(b.startTime))
+    let cs = sorted[0].startTime
+    let ce = sorted[0].endTime
+
+    for (let i = 1; i < sorted.length; i++) {
+      if (sorted[i].startTime === ce) {
+        ce = sorted[i].endTime
+      } else {
+        result.push({ roomId, startTime: cs, endTime: ce })
+        cs = sorted[i].startTime
+        ce = sorted[i].endTime
+      }
+    }
+    result.push({ roomId, startTime: cs, endTime: ce })
+  }
+  return result
+}
+
+function getMemberName(userId: string): string {
+  const m = FamilyRepository.findMemberById(userId)
+  return m?.name ?? '其他用户'
+}
+
+function validateAndCheckConflicts(
+  mergedRequests: CreateBookingRequest[],
+): {
+  totalCredits: number
+  conflicts: BookingConflictInfo[]
+} {
+  let totalCredits = 0
+  const conflicts: BookingConflictInfo[] = []
+
+  for (const req of mergedRequests) {
+    const room = RoomRepository.findById(req.roomId)
+    if (!room) {
+      throw new Error('琴房不存在')
+    }
+
+    const start = new Date(req.startTime)
+    const end = new Date(req.endTime)
+    if (start >= end) {
+      throw new Error('结束时间必须晚于开始时间')
+    }
+
+    const durationMinutes = calculateDurationMinutes(req.startTime, req.endTime)
+    if (durationMinutes % 30 !== 0) {
+      throw new Error('预约时长必须是 30 分钟的整数倍')
+    }
+
+    const existingConflicts = BookingRepository.findByRoomAndTimeRange(
+      req.roomId,
+      req.startTime,
+      req.endTime,
+    )
+
+    if (existingConflicts.length > 0) {
+      for (const c of existingConflicts) {
+        conflicts.push({
+          roomId: req.roomId,
+          startTime: c.startTime,
+          endTime: c.endTime,
+          conflictUserId: c.userId,
+          conflictUserName: getMemberName(c.userId),
+        })
+      }
+    }
+
+    const credits = calculateCredits(durationMinutes, room.hourlyRate)
+    totalCredits = Math.round((totalCredits + credits) * 100) / 100
+  }
+
+  return { totalCredits, conflicts }
+}
+
+function createBookingsWithMerge(
+  userId: string,
+  familyId: string,
+  mergedRequests: CreateBookingRequest[],
+): Booking[] {
+  const createdIds: string[] = []
+  const result: Booking[] = []
+
+  for (const req of mergedRequests) {
+    const room = RoomRepository.findById(req.roomId)!
+    const durationMinutes = calculateDurationMinutes(req.startTime, req.endTime)
+    const credits = calculateCredits(durationMinutes, room.hourlyRate)
+
+    let booking = BookingRepository.create({
+      userId,
+      familyId,
+      roomId: req.roomId,
+      startTime: req.startTime,
+      endTime: req.endTime,
+      durationMinutes,
+      creditsUsed: credits,
+      isMerged: false,
+      mergedFromIds: [],
+      status: 'active',
+    })
+    createdIds.push(booking.id)
+
+    const adjacents = BookingRepository.findAdjacentBookings(
+      req.roomId,
+      userId,
+      req.startTime,
+      req.endTime,
+    ).filter((b) => !createdIds.includes(b.id) && b.status === 'active')
+
+    if (adjacents.length > 0) {
+      const allToMerge = [booking, ...adjacents]
+      const minStart = allToMerge.reduce(
+        (min, b) => (new Date(b.startTime) < new Date(min) ? b.startTime : min),
+        booking.startTime,
+      )
+      const maxEnd = allToMerge.reduce(
+        (max, b) => (new Date(b.endTime) > new Date(max) ? b.endTime : max),
+        booking.endTime,
+      )
+      const totalDuration = calculateDurationMinutes(minStart, maxEnd)
+      const totalCreditsForMerge = calculateCredits(totalDuration, room.hourlyRate)
+      const mergedIds = allToMerge.map((b) => b.id)
+
+      adjacents.forEach((b) => BookingRepository.delete(b.id))
+      BookingRepository.delete(booking.id)
+
+      booking = BookingRepository.create({
+        userId,
+        familyId,
+        roomId: req.roomId,
+        startTime: minStart,
+        endTime: maxEnd,
+        durationMinutes: totalDuration,
+        creditsUsed: totalCreditsForMerge,
+        isMerged: true,
+        mergedFromIds,
+        status: 'active',
+      })
+    }
+
+    result.push(booking)
+  }
+
+  return result
+}
+
+function buildLockKeys(roomIds: string[], familyId: string): string[] {
+  const roomKeys = [...new Set(roomIds)]
+    .sort()
+    .map((id) => `room:booking:${id}`)
+  return [...roomKeys, `family:credits:${familyId}`]
+}
+
 export const BookingService = {
   async createBatchBookings(
     userId: string,
@@ -40,155 +208,34 @@ export const BookingService = {
       throw new Error('用户不存在')
     }
 
-    const roomIds = [...new Set(request.bookings.map((b) => b.roomId))]
+    const mergedRequests = mergeAdjacentByRoom(request.bookings)
+    const roomIds = [...new Set(mergedRequests.map((r) => r.roomId))]
+    const lockKeys = buildLockKeys(roomIds, member.familyId)
 
-    const lockKeys = [
-      `family:credits:${member.familyId}`,
-      ...roomIds.map((id) => `room:booking:${id}`),
-    ].sort()
-
-    return lockManager.runWithLock(
-      lockKeys.join('|'),
+    return lockManager.runWithMultiLock(
+      lockKeys,
       async () => {
         beginTransaction()
-
         try {
-          const createdBookingIds: string[] = []
-          let totalCredits = 0
-          const allBookings: Booking[] = []
-
-          const requestsByRoom = new Map<string, typeof request.bookings>()
-          for (const req of request.bookings) {
-            const arr = requestsByRoom.get(req.roomId) || []
-            arr.push(req)
-            requestsByRoom.set(req.roomId, arr)
-          }
-
-          const mergedRequests: CreateBookingRequest[] = []
-          for (const [roomId, reqs] of requestsByRoom) {
-            const sorted = [...reqs].sort((a, b) =>
-              a.startTime.localeCompare(b.startTime)
-            )
-            let currentStart = sorted[0].startTime
-            let currentEnd = sorted[0].endTime
-
-            for (let i = 1; i < sorted.length; i++) {
-              if (sorted[i].startTime === currentEnd) {
-                currentEnd = sorted[i].endTime
-              } else {
-                mergedRequests.push({ roomId, startTime: currentStart, endTime: currentEnd })
-                currentStart = sorted[i].startTime
-                currentEnd = sorted[i].endTime
-              }
-            }
-            mergedRequests.push({ roomId, startTime: currentStart, endTime: currentEnd })
-          }
-
-          for (const req of mergedRequests) {
-            const room = RoomRepository.findById(req.roomId)
-            if (!room) {
-              throw new Error('琴房不存在')
-            }
-
-            const start = new Date(req.startTime)
-            const end = new Date(req.endTime)
-            if (start >= end) {
-              throw new Error('结束时间必须晚于开始时间')
-            }
-
-            const durationMinutes = calculateDurationMinutes(req.startTime, req.endTime)
-            if (durationMinutes % 30 !== 0) {
-              throw new Error('预约时长必须是 30 分钟的整数倍')
-            }
-
-            const conflicts = BookingRepository.findByRoomAndTimeRange(
-              req.roomId,
-              req.startTime,
-              req.endTime,
-            )
-            if (conflicts.length > 0) {
-              throw new Error(
-                `时段 ${req.startTime} - ${req.endTime} 已被他人预约，请刷新后重新选择`
-              )
-            }
-
-            const credits = calculateCredits(durationMinutes, room.hourlyRate)
-            totalCredits = Math.round((totalCredits + credits) * 100) / 100
+          const { totalCredits, conflicts } = validateAndCheckConflicts(mergedRequests)
+          if (conflicts.length > 0) {
+            rollback()
+            throw new BookingConflictError(conflicts)
           }
 
           const account = FamilyRepository.findAccountById(member.familyId)
           if (!account) {
+            rollback()
             throw new Error('家庭账户不存在')
           }
           if (account.creditsBalance < totalCredits) {
-            throw new Error(
-              `额度不足。当前剩余 ${account.creditsBalance} 点，本次共需 ${totalCredits} 点`
-            )
+            rollback()
+            throw new CreditInsufficientError(account.creditsBalance, totalCredits)
           }
 
-          for (const req of mergedRequests) {
-            const room = RoomRepository.findById(req.roomId)!
-            const durationMinutes = calculateDurationMinutes(req.startTime, req.endTime)
-            const credits = calculateCredits(durationMinutes, room.hourlyRate)
+          const bookings = createBookingsWithMerge(userId, member.familyId, mergedRequests)
 
-            let booking = BookingRepository.create({
-              userId,
-              familyId: member.familyId,
-              roomId: req.roomId,
-              startTime: req.startTime,
-              endTime: req.endTime,
-              durationMinutes,
-              creditsUsed: credits,
-              isMerged: false,
-              mergedFromIds: [],
-              status: 'active',
-            })
-
-            createdBookingIds.push(booking.id)
-
-            const adjacentBookings = BookingRepository.findAdjacentBookings(
-              req.roomId,
-              userId,
-              req.startTime,
-              req.endTime,
-            ).filter((b) => !createdBookingIds.includes(b.id) && b.status === 'active')
-
-            if (adjacentBookings.length > 0) {
-              const allToMerge = [booking, ...adjacentBookings]
-              const minStart = allToMerge.reduce(
-                (min, b) => (new Date(b.startTime) < new Date(min) ? b.startTime : min),
-                booking.startTime,
-              )
-              const maxEnd = allToMerge.reduce(
-                (max, b) => (new Date(b.endTime) > new Date(max) ? b.endTime : max),
-                booking.endTime,
-              )
-              const totalDuration = calculateDurationMinutes(minStart, maxEnd)
-              const totalCreditsForMerge = calculateCredits(totalDuration, room.hourlyRate)
-              const mergedIds = allToMerge.map((b) => b.id)
-
-              adjacentBookings.forEach((b) => BookingRepository.delete(b.id))
-              BookingRepository.delete(booking.id)
-
-              booking = BookingRepository.create({
-                userId,
-                familyId: member.familyId,
-                roomId: req.roomId,
-                startTime: minStart,
-                endTime: maxEnd,
-                durationMinutes: totalDuration,
-                creditsUsed: totalCreditsForMerge,
-                isMerged: true,
-                mergedFromIds: mergedIds,
-                status: 'active',
-              })
-            }
-
-            allBookings.push(booking)
-          }
-
-          let deducted = false
-          for (const booking of allBookings) {
+          for (const booking of bookings) {
             await CreditService.deductCredits(
               member.familyId,
               userId,
@@ -196,23 +243,22 @@ export const BookingService = {
               booking.id,
               `预约 琴房 ${formatDate(new Date(booking.startTime))}`,
             )
-            deducted = true
           }
 
-          if (!deducted) {
-            throw new Error('额度扣减失败')
+          const { conflicts: finalConflicts } = validateAndCheckConflicts(mergedRequests)
+          if (finalConflicts.length > 0) {
+            rollback()
+            throw new BookingConflictError(finalConflicts)
           }
 
           commit()
-
-          return allBookings
+          return bookings
         } catch (error) {
-          rollback()
+          try { rollback() } catch { /* ignore */ }
           throw error
         }
       },
-      20000,
-      3,
+      15000,
     )
   },
 
@@ -230,97 +276,56 @@ export const BookingService = {
       throw new Error('琴房不存在')
     }
 
-    const start = new Date(request.startTime)
-    const end = new Date(request.endTime)
-    if (start >= end) {
-      throw new Error('结束时间必须晚于开始时间')
-    }
+    const lockKeys = buildLockKeys([request.roomId], member.familyId)
 
-    const durationMinutes = calculateDurationMinutes(request.startTime, request.endTime)
-    if (durationMinutes % 30 !== 0) {
-      throw new Error('预约时长必须是 30 分钟的整数倍')
-    }
+    return lockManager.runWithMultiLock(
+      lockKeys,
+      async () => {
+        beginTransaction()
+        try {
+          const { totalCredits, conflicts } = validateAndCheckConflicts([request])
+          if (conflicts.length > 0) {
+            rollback()
+            throw new BookingConflictError(conflicts)
+          }
 
-    const lockKey = `room:booking:${request.roomId}`
+          const account = FamilyRepository.findAccountById(member.familyId)
+          if (!account) {
+            rollback()
+            throw new Error('家庭账户不存在')
+          }
+          if (account.creditsBalance < totalCredits) {
+            rollback()
+            throw new CreditInsufficientError(account.creditsBalance, totalCredits)
+          }
 
-    return lockManager.runWithLock(lockKey, async () => {
-      const conflicts = BookingRepository.findByRoomAndTimeRange(
-        request.roomId,
-        request.startTime,
-        request.endTime,
-      )
-      if (conflicts.length > 0) {
-        throw new Error('该时段已被预约')
-      }
+          const bookings = createBookingsWithMerge(userId, member.familyId, [request])
 
-      const creditsNeeded = calculateCredits(durationMinutes, room.hourlyRate)
+          for (const booking of bookings) {
+            await CreditService.deductCredits(
+              member.familyId,
+              userId,
+              booking.creditsUsed,
+              booking.id,
+              `预约 ${room.name} ${formatDate(new Date(request.startTime))}`,
+            )
+          }
 
-      let booking = BookingRepository.create({
-        userId,
-        familyId: member.familyId,
-        roomId: request.roomId,
-        startTime: request.startTime,
-        endTime: request.endTime,
-        durationMinutes,
-        creditsUsed: creditsNeeded,
-        isMerged: false,
-        mergedFromIds: [],
-        status: 'active',
-      })
+          const { conflicts: finalConflictsSingle } = validateAndCheckConflicts([request])
+          if (finalConflictsSingle.length > 0) {
+            rollback()
+            throw new BookingConflictError(finalConflictsSingle)
+          }
 
-      try {
-        await CreditService.deductCredits(
-          member.familyId,
-          userId,
-          creditsNeeded,
-          booking.id,
-          `预约 ${room.name} ${formatDate(new Date(request.startTime))}`,
-        )
-      } catch (error) {
-        BookingRepository.delete(booking.id)
-        throw error
-      }
-
-      const adjacentBookings = BookingRepository.findAdjacentBookings(
-        request.roomId,
-        userId,
-        request.startTime,
-        request.endTime,
-      )
-
-      if (adjacentBookings.length > 0) {
-        const allBookings = [booking, ...adjacentBookings]
-        const minStart = allBookings.reduce(
-          (min, b) => (new Date(b.startTime) < new Date(min) ? b.startTime : min),
-          booking.startTime,
-        )
-        const maxEnd = allBookings.reduce(
-          (max, b) => (new Date(b.endTime) > new Date(max) ? b.endTime : max),
-          booking.endTime,
-        )
-        const totalDuration = calculateDurationMinutes(minStart, maxEnd)
-        const totalCredits = calculateCredits(totalDuration, room.hourlyRate)
-        const mergedIds = allBookings.map((b) => b.id)
-
-        adjacentBookings.forEach((b) => BookingRepository.delete(b.id))
-        BookingRepository.delete(booking.id)
-
-        booking = BookingRepository.create({
-          userId,
-          familyId: member.familyId,
-          roomId: request.roomId,
-          startTime: minStart,
-          endTime: maxEnd,
-          durationMinutes: totalDuration,
-          creditsUsed: totalCredits,
-          isMerged: true,
-          mergedFromIds: mergedIds,
-          status: 'active',
-        })
-      }
-
-      return booking
-    })
+          commit()
+          return bookings[0]
+        } catch (error) {
+          try { rollback() } catch { /* ignore */ }
+          throw error
+        }
+      },
+      15000,
+    )
   },
 
   async cancelBooking(userId: string, bookingId: string): Promise<void> {
@@ -340,24 +345,36 @@ export const BookingService = {
       throw new Error('用户不存在')
     }
 
-    const lockKey = `room:booking:${booking.roomId}`
+    const lockKeys = buildLockKeys([booking.roomId], member.familyId)
 
-    await lockManager.runWithLock(lockKey, async () => {
-      const currentBooking = BookingRepository.findById(bookingId)
-      if (!currentBooking || currentBooking.status !== 'active') {
-        return
-      }
+    await lockManager.runWithMultiLock(
+      lockKeys,
+      async () => {
+        beginTransaction()
+        try {
+          const currentBooking = BookingRepository.findById(bookingId)
+          if (!currentBooking || currentBooking.status !== 'active') {
+            commit()
+            return
+          }
 
-      await CreditService.refundCredits(
-        currentBooking.familyId,
-        userId,
-        currentBooking.creditsUsed,
-        currentBooking.id,
-        `退订预约 ${formatDate(new Date(currentBooking.startTime))}`,
-      )
+          await CreditService.refundCredits(
+            currentBooking.familyId,
+            userId,
+            currentBooking.creditsUsed,
+            currentBooking.id,
+            `退订预约 ${formatDate(new Date(currentBooking.startTime))}`,
+          )
 
-      BookingRepository.cancel(currentBooking.id)
-    })
+          BookingRepository.cancel(currentBooking.id)
+          commit()
+        } catch (error) {
+          try { rollback() } catch { /* ignore */ }
+          throw error
+        }
+      },
+      15000,
+    )
   },
 
   async cancelBookingWithSplit(
@@ -396,120 +413,135 @@ export const BookingService = {
       throw new Error('拆分时段无效')
     }
 
-    const lockKey = `room:booking:${booking.roomId}`
+    const lockKeys = buildLockKeys([booking.roomId], member.familyId)
 
-    return lockManager.runWithLock(lockKey, async () => {
-      const currentBooking = BookingRepository.findById(bookingId)
-      if (!currentBooking || currentBooking.status !== 'active') {
-        return []
-      }
+    return lockManager.runWithMultiLock(
+      lockKeys,
+      async () => {
+        beginTransaction()
+        try {
+          const currentBooking = BookingRepository.findById(bookingId)
+          if (!currentBooking || currentBooking.status !== 'active') {
+            commit()
+            return []
+          }
 
-      const resultBookings: Booking[] = []
-      const splitDuration = calculateDurationMinutes(splitStartTime, splitEndTime)
-      const splitCredits = calculateCredits(splitDuration, room.hourlyRate)
+          const resultBookings: Booking[] = []
+          const splitDuration = calculateDurationMinutes(splitStartTime, splitEndTime)
+          const splitCredits = calculateCredits(splitDuration, room.hourlyRate)
 
-      if (splitStartTime === currentBooking.startTime && splitEndTime === currentBooking.endTime) {
-        await CreditService.refundCredits(
-          currentBooking.familyId,
-          userId,
-          currentBooking.creditsUsed,
-          currentBooking.id,
-          `退订预约 ${formatDate(new Date(currentBooking.startTime))}`,
-        )
-        BookingRepository.cancel(currentBooking.id)
-        return resultBookings
-      }
+          if (splitStartTime === currentBooking.startTime && splitEndTime === currentBooking.endTime) {
+            await CreditService.refundCredits(
+              currentBooking.familyId,
+              userId,
+              currentBooking.creditsUsed,
+              currentBooking.id,
+              `退订预约 ${formatDate(new Date(currentBooking.startTime))}`,
+            )
+            BookingRepository.cancel(currentBooking.id)
+            commit()
+            return resultBookings
+          }
 
-      if (splitStartTime === currentBooking.startTime) {
-        const remainingDuration = calculateDurationMinutes(splitEndTime, currentBooking.endTime)
-        const remainingCredits = calculateCredits(remainingDuration, room.hourlyRate)
+          if (splitStartTime === currentBooking.startTime) {
+            const remainingDuration = calculateDurationMinutes(splitEndTime, currentBooking.endTime)
+            const remainingCredits = calculateCredits(remainingDuration, room.hourlyRate)
 
-        BookingRepository.update(currentBooking.id, {
-          startTime: splitEndTime,
-          durationMinutes: remainingDuration,
-          creditsUsed: remainingCredits,
-          isMerged: false,
-          mergedFromIds: [],
-        })
+            BookingRepository.update(currentBooking.id, {
+              startTime: splitEndTime,
+              durationMinutes: remainingDuration,
+              creditsUsed: remainingCredits,
+              isMerged: false,
+              mergedFromIds: [],
+            })
 
-        await CreditService.refundCredits(
-          currentBooking.familyId,
-          userId,
-          splitCredits,
-          currentBooking.id,
-          `部分退订 ${formatDate(new Date(splitStartTime))}`,
-        )
+            await CreditService.refundCredits(
+              currentBooking.familyId,
+              userId,
+              splitCredits,
+              currentBooking.id,
+              `部分退订 ${formatDate(new Date(splitStartTime))}`,
+            )
 
-        const updated = BookingRepository.findById(currentBooking.id)
-        if (updated) resultBookings.push(updated)
-        return resultBookings
-      }
+            const updated = BookingRepository.findById(currentBooking.id)
+            if (updated) resultBookings.push(updated)
+            commit()
+            return resultBookings
+          }
 
-      if (splitEndTime === currentBooking.endTime) {
-        const remainingDuration = calculateDurationMinutes(currentBooking.startTime, splitStartTime)
-        const remainingCredits = calculateCredits(remainingDuration, room.hourlyRate)
+          if (splitEndTime === currentBooking.endTime) {
+            const remainingDuration = calculateDurationMinutes(currentBooking.startTime, splitStartTime)
+            const remainingCredits = calculateCredits(remainingDuration, room.hourlyRate)
 
-        BookingRepository.update(currentBooking.id, {
-          endTime: splitStartTime,
-          durationMinutes: remainingDuration,
-          creditsUsed: remainingCredits,
-          isMerged: false,
-          mergedFromIds: [],
-        })
+            BookingRepository.update(currentBooking.id, {
+              endTime: splitStartTime,
+              durationMinutes: remainingDuration,
+              creditsUsed: remainingCredits,
+              isMerged: false,
+              mergedFromIds: [],
+            })
 
-        await CreditService.refundCredits(
-          currentBooking.familyId,
-          userId,
-          splitCredits,
-          currentBooking.id,
-          `部分退订 ${formatDate(new Date(splitStartTime))}`,
-        )
+            await CreditService.refundCredits(
+              currentBooking.familyId,
+              userId,
+              splitCredits,
+              currentBooking.id,
+              `部分退订 ${formatDate(new Date(splitStartTime))}`,
+            )
 
-        const updated = BookingRepository.findById(currentBooking.id)
-        if (updated) resultBookings.push(updated)
-        return resultBookings
-      }
+            const updated = BookingRepository.findById(currentBooking.id)
+            if (updated) resultBookings.push(updated)
+            commit()
+            return resultBookings
+          }
 
-      const beforeDuration = calculateDurationMinutes(currentBooking.startTime, splitStartTime)
-      const beforeCredits = calculateCredits(beforeDuration, room.hourlyRate)
-      const afterDuration = calculateDurationMinutes(splitEndTime, currentBooking.endTime)
-      const afterCredits = calculateCredits(afterDuration, room.hourlyRate)
+          const beforeDuration = calculateDurationMinutes(currentBooking.startTime, splitStartTime)
+          const beforeCredits = calculateCredits(beforeDuration, room.hourlyRate)
+          const afterDuration = calculateDurationMinutes(splitEndTime, currentBooking.endTime)
+          const afterCredits = calculateCredits(afterDuration, room.hourlyRate)
 
-      BookingRepository.update(currentBooking.id, {
-        endTime: splitStartTime,
-        durationMinutes: beforeDuration,
-        creditsUsed: beforeCredits,
-        isMerged: false,
-        mergedFromIds: [],
-      })
+          BookingRepository.update(currentBooking.id, {
+            endTime: splitStartTime,
+            durationMinutes: beforeDuration,
+            creditsUsed: beforeCredits,
+            isMerged: false,
+            mergedFromIds: [],
+          })
 
-      const afterBooking = BookingRepository.create({
-        userId: currentBooking.userId,
-        familyId: currentBooking.familyId,
-        roomId: currentBooking.roomId,
-        startTime: splitEndTime,
-        endTime: currentBooking.endTime,
-        durationMinutes: afterDuration,
-        creditsUsed: afterCredits,
-        isMerged: false,
-        mergedFromIds: [],
-        status: 'active',
-      })
+          const afterBooking = BookingRepository.create({
+            userId: currentBooking.userId,
+            familyId: currentBooking.familyId,
+            roomId: currentBooking.roomId,
+            startTime: splitEndTime,
+            endTime: currentBooking.endTime,
+            durationMinutes: afterDuration,
+            creditsUsed: afterCredits,
+            isMerged: false,
+            mergedFromIds: [],
+            status: 'active',
+          })
 
-      await CreditService.refundCredits(
-        currentBooking.familyId,
-        userId,
-        splitCredits,
-        currentBooking.id,
-        `中间时段退订 ${formatDate(new Date(splitStartTime))}`,
-      )
+          await CreditService.refundCredits(
+            currentBooking.familyId,
+            userId,
+            splitCredits,
+            currentBooking.id,
+            `中间时段退订 ${formatDate(new Date(splitStartTime))}`,
+          )
 
-      const beforeUpdated = BookingRepository.findById(currentBooking.id)
-      if (beforeUpdated) resultBookings.push(beforeUpdated)
-      resultBookings.push(afterBooking)
+          const beforeUpdated = BookingRepository.findById(currentBooking.id)
+          if (beforeUpdated) resultBookings.push(beforeUpdated)
+          resultBookings.push(afterBooking)
 
-      return resultBookings
-    })
+          commit()
+          return resultBookings
+        } catch (error) {
+          try { rollback() } catch { /* ignore */ }
+          throw error
+        }
+      },
+      15000,
+    )
   },
 
   getBookingsByUser(userId: string): Booking[] {
@@ -561,3 +593,5 @@ export const BookingService = {
     return slots
   },
 }
+
+export default BookingService

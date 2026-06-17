@@ -11,12 +11,20 @@ import type {
   CreateBatchBookingRequest,
   AddMemberRequest,
   FamilyMember,
+  BookingConflictInfo,
 } from '@/../shared/types';
 
 const BASE_URL = '/api';
 
 function getUserId(): string {
   return localStorage.getItem('userId') || 'user-1';
+}
+
+export interface ApiError extends Error {
+  code?: string;
+  conflicts?: BookingConflictInfo[];
+  currentBalance?: number;
+  requiredAmount?: number;
 }
 
 async function request<T>(
@@ -35,7 +43,12 @@ async function request<T>(
   const json = await response.json().catch(() => ({ success: false, message: response.statusText }));
 
   if (!response.ok || !json.success) {
-    throw new Error(json.message || `HTTP ${response.status}`);
+    const err = new Error(json.message || `HTTP ${response.status}`) as ApiError;
+    if (json.code) err.code = json.code;
+    if (json.conflicts) err.conflicts = json.conflicts;
+    if (json.currentBalance !== undefined) err.currentBalance = json.currentBalance;
+    if (json.requiredAmount !== undefined) err.requiredAmount = json.requiredAmount;
+    throw err;
   }
 
   return json.data as T;

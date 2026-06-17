@@ -1,7 +1,8 @@
 import type { Request, Response } from 'express'
 import { BookingService } from '../services/BookingService.js'
 import { LockTimeoutError, LockQueueFullError } from '../utils/LockManager.js'
-import type { CreateBookingRequest, CreateBatchBookingRequest } from '../../shared/types.js'
+import { CreditInsufficientError } from '../services/CreditService.js'
+import { BookingConflictError, type CreateBookingRequest, type CreateBatchBookingRequest } from '../../shared/types.js'
 
 function handleError(res: Response, error: unknown, defaultMessage: string): void {
   if (error instanceof LockTimeoutError) {
@@ -17,6 +18,25 @@ function handleError(res: Response, error: unknown, defaultMessage: string): voi
       success: false,
       message: error.message,
       code: 'LOCK_QUEUE_FULL',
+    })
+    return
+  }
+  if (error instanceof BookingConflictError) {
+    res.status(409).json({
+      success: false,
+      message: error.message,
+      code: 'BOOKING_CONFLICT',
+      conflicts: error.conflicts,
+    })
+    return
+  }
+  if (error instanceof CreditInsufficientError) {
+    res.status(402).json({
+      success: false,
+      message: error.message,
+      code: 'CREDIT_INSUFFICIENT',
+      currentBalance: error.currentBalance,
+      requiredAmount: error.requiredAmount,
     })
     return
   }

@@ -113,3 +113,36 @@ export interface AddMemberRequest {
   role: 'owner' | 'member'
   avatar: string
 }
+
+export interface BookingConflictInfo {
+  roomId: string
+  startTime: string
+  endTime: string
+  conflictUserId?: string
+  conflictUserName?: string
+}
+
+export class BookingConflictError extends Error {
+  public readonly conflicts: BookingConflictInfo[]
+  constructor(conflicts: BookingConflictInfo[], message?: string) {
+    super(
+      message ||
+        `以下时段已被他人预约：${conflicts
+          .map(
+            (c) =>
+              `${c.startTime.replace('T', ' ').slice(5, 16)}-${c.endTime.slice(11, 16)}`
+          )
+          .join('；')}，请刷新页面重新选择`
+    )
+    this.name = 'BookingConflictError'
+    this.conflicts = conflicts
+  }
+
+  toJSON() {
+    return {
+      name: this.name,
+      message: this.message,
+      conflicts: this.conflicts,
+    }
+  }
+}

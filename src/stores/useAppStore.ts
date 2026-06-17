@@ -30,6 +30,7 @@ interface AppState {
   setScheduleSlots: (slots: ScheduleSlot[]) => void;
   toggleSelectedSlot: (slot: SelectedSlot) => void;
   clearSelectedSlots: () => void;
+  removeSelectedSlots: (slots: SelectedSlot[]) => void;
 }
 
 export const useAppStore = create<AppState>((set) => ({
@@ -67,4 +68,15 @@ export const useAppStore = create<AppState>((set) => ({
       return { selectedSlots: [...state.selectedSlots, slot] };
     }),
   clearSelectedSlots: () => set({ selectedSlots: [] }),
+  removeSelectedSlots: (toRemove) =>
+    set((state) => {
+      const toRemoveSet = new Set(
+        toRemove.map((s) => `${s.roomId}|${s.date}|${s.startTime}`)
+      );
+      return {
+        selectedSlots: state.selectedSlots.filter(
+          (s) => !toRemoveSet.has(`${s.roomId}|${s.date}|${s.startTime}`)
+        ),
+      };
+    }),
 }));
