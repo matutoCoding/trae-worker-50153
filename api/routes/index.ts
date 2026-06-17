@@ -43,6 +43,7 @@ router.post('/rooms', authMiddleware, RoomController.createRoom)
 
 router.get('/bookings/mine', authMiddleware, BookingController.getMyBookings)
 router.post('/bookings', authMiddleware, BookingController.createBooking)
+router.post('/bookings/batch', authMiddleware, BookingController.createBatchBookings)
 router.delete('/bookings/:id', authMiddleware, BookingController.cancelBooking)
 
 router.get('/schedule', authMiddleware, BookingController.getSchedule)

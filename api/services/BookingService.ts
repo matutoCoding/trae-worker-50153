@@ -3,7 +3,13 @@ import { RoomRepository } from '../repositories/RoomRepository.js'
 import { FamilyRepository } from '../repositories/FamilyRepository.js'
 import { CreditService } from './CreditService.js'
 import { lockManager } from '../utils/LockManager.js'
-import type { Booking, CreateBookingRequest, ScheduleSlot } from '../../shared/types.js'
+import { beginTransaction, commit, rollback } from '../db/dbUtils.js'
+import type {
+  Booking,
+  CreateBookingRequest,
+  CreateBatchBookingRequest,
+  ScheduleSlot,
+} from '../../shared/types.js'
 
 function calculateDurationMinutes(startTime: string, endTime: string): number {
   const start = new Date(startTime).getTime()
@@ -21,6 +27,195 @@ function formatDate(date: Date): string {
 }
 
 export const BookingService = {
+  async createBatchBookings(
+    userId: string,
+    request: CreateBatchBookingRequest,
+  ): Promise<Booking[]> {
+    if (!request.bookings || request.bookings.length === 0) {
+      throw new Error('预约时段不能为空')
+    }
+
+    const member = FamilyRepository.findMemberById(userId)
+    if (!member) {
+      throw new Error('用户不存在')
+    }
+
+    const roomIds = [...new Set(request.bookings.map((b) => b.roomId))]
+
+    const lockKeys = [
+      `family:credits:${member.familyId}`,
+      ...roomIds.map((id) => `room:booking:${id}`),
+    ].sort()
+
+    return lockManager.runWithLock(
+      lockKeys.join('|'),
+      async () => {
+        beginTransaction()
+
+        try {
+          const createdBookingIds: string[] = []
+          let totalCredits = 0
+          const allBookings: Booking[] = []
+
+          const requestsByRoom = new Map<string, typeof request.bookings>()
+          for (const req of request.bookings) {
+            const arr = requestsByRoom.get(req.roomId) || []
+            arr.push(req)
+            requestsByRoom.set(req.roomId, arr)
+          }
+
+          const mergedRequests: CreateBookingRequest[] = []
+          for (const [roomId, reqs] of requestsByRoom) {
+            const sorted = [...reqs].sort((a, b) =>
+              a.startTime.localeCompare(b.startTime)
+            )
+            let currentStart = sorted[0].startTime
+            let currentEnd = sorted[0].endTime
+
+            for (let i = 1; i < sorted.length; i++) {
+              if (sorted[i].startTime === currentEnd) {
+                currentEnd = sorted[i].endTime
+              } else {
+                mergedRequests.push({ roomId, startTime: currentStart, endTime: currentEnd })
+                currentStart = sorted[i].startTime
+                currentEnd = sorted[i].endTime
+              }
+            }
+            mergedRequests.push({ roomId, startTime: currentStart, endTime: currentEnd })
+          }
+
+          for (const req of mergedRequests) {
+            const room = RoomRepository.findById(req.roomId)
+            if (!room) {
+              throw new Error('琴房不存在')
+            }
+
+            const start = new Date(req.startTime)
+            const end = new Date(req.endTime)
+            if (start >= end) {
+              throw new Error('结束时间必须晚于开始时间')
+            }
+
+            const durationMinutes = calculateDurationMinutes(req.startTime, req.endTime)
+            if (durationMinutes % 30 !== 0) {
+              throw new Error('预约时长必须是 30 分钟的整数倍')
+            }
+
+            const conflicts = BookingRepository.findByRoomAndTimeRange(
+              req.roomId,
+              req.startTime,
+              req.endTime,
+            )
+            if (conflicts.length > 0) {
+              throw new Error(
+                `时段 ${req.startTime} - ${req.endTime} 已被他人预约，请刷新后重新选择`
+              )
+            }
+
+            const credits = calculateCredits(durationMinutes, room.hourlyRate)
+            totalCredits = Math.round((totalCredits + credits) * 100) / 100
+          }
+
+          const account = FamilyRepository.findAccountById(member.familyId)
+          if (!account) {
+            throw new Error('家庭账户不存在')
+          }
+          if (account.creditsBalance < totalCredits) {
+            throw new Error(
+              `额度不足。当前剩余 ${account.creditsBalance} 点，本次共需 ${totalCredits} 点`
+            )
+          }
+
+          for (const req of mergedRequests) {
+            const room = RoomRepository.findById(req.roomId)!
+            const durationMinutes = calculateDurationMinutes(req.startTime, req.endTime)
+            const credits = calculateCredits(durationMinutes, room.hourlyRate)
+
+            let booking = BookingRepository.create({
+              userId,
+              familyId: member.familyId,
+              roomId: req.roomId,
+              startTime: req.startTime,
+              endTime: req.endTime,
+              durationMinutes,
+              creditsUsed: credits,
+              isMerged: false,
+              mergedFromIds: [],
+              status: 'active',
+            })
+
+            createdBookingIds.push(booking.id)
+
+            const adjacentBookings = BookingRepository.findAdjacentBookings(
+              req.roomId,
+              userId,
+              req.startTime,
+              req.endTime,
+            ).filter((b) => !createdBookingIds.includes(b.id) && b.status === 'active')
+
+            if (adjacentBookings.length > 0) {
+              const allToMerge = [booking, ...adjacentBookings]
+              const minStart = allToMerge.reduce(
+                (min, b) => (new Date(b.startTime) < new Date(min) ? b.startTime : min),
+                booking.startTime,
+              )
+              const maxEnd = allToMerge.reduce(
+                (max, b) => (new Date(b.endTime) > new Date(max) ? b.endTime : max),
+                booking.endTime,
+              )
+              const totalDuration = calculateDurationMinutes(minStart, maxEnd)
+              const totalCreditsForMerge = calculateCredits(totalDuration, room.hourlyRate)
+              const mergedIds = allToMerge.map((b) => b.id)
+
+              adjacentBookings.forEach((b) => BookingRepository.delete(b.id))
+              BookingRepository.delete(booking.id)
+
+              booking = BookingRepository.create({
+                userId,
+                familyId: member.familyId,
+                roomId: req.roomId,
+                startTime: minStart,
+                endTime: maxEnd,
+                durationMinutes: totalDuration,
+                creditsUsed: totalCreditsForMerge,
+                isMerged: true,
+                mergedFromIds: mergedIds,
+                status: 'active',
+              })
+            }
+
+            allBookings.push(booking)
+          }
+
+          let deducted = false
+          for (const booking of allBookings) {
+            await CreditService.deductCredits(
+              member.familyId,
+              userId,
+              booking.creditsUsed,
+              booking.id,
+              `预约 琴房 ${formatDate(new Date(booking.startTime))}`,
+            )
+            deducted = true
+          }
+
+          if (!deducted) {
+            throw new Error('额度扣减失败')
+          }
+
+          commit()
+
+          return allBookings
+        } catch (error) {
+          rollback()
+          throw error
+        }
+      },
+      20000,
+      3,
+    )
+  },
+
   async createBooking(
     userId: string,
     request: CreateBookingRequest,

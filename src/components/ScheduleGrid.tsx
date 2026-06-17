@@ -40,6 +40,7 @@ export default function ScheduleGrid() {
   const [weekStart, setWeekStart] = useState<Date>(getMonday(new Date()));
   const [scheduleData, setScheduleData] = useState<Map<string, ScheduleSlot>>(new Map());
   const [loading, setLoading] = useState(false);
+  const [bookingLoading, setBookingLoading] = useState(false);
   const [bookingError, setBookingError] = useState<string | null>(null);
   const [showDrawer, setShowDrawer] = useState(false);
 
@@ -141,21 +142,21 @@ export default function ScheduleGrid() {
 
   const handleConfirm = async () => {
     setBookingError(null);
+    setBookingLoading(true);
     try {
-      const promises: Promise<unknown>[] = [];
+      const batchBookings: { roomId: string; startTime: string; endTime: string }[] = [];
+
       selectedByRoom.forEach((slots, roomId) => {
         const sorted = [...slots].sort((a, b) => a.startTime.localeCompare(b.startTime));
         let currentStart = sorted[0];
         let prevEnd = sorted[0];
 
         const flush = () => {
-          promises.push(
-            api.createBooking({
-              roomId,
-              startTime: `${currentStart.date}T${currentStart.startTime}:00`,
-              endTime: `${prevEnd.date}T${prevEnd.endTime}:00`,
-            })
-          );
+          batchBookings.push({
+            roomId,
+            startTime: `${currentStart.date}T${currentStart.startTime}:00`,
+            endTime: `${prevEnd.date}T${prevEnd.endTime}:00`,
+          });
         };
 
         for (let i = 1; i < sorted.length; i++) {
@@ -171,12 +172,24 @@ export default function ScheduleGrid() {
         flush();
       });
 
-      await Promise.all(promises);
+      await api.createBatchBookings({ bookings: batchBookings });
+
       clearSelectedSlots();
       setShowDrawer(false);
       window.location.reload();
     } catch (e) {
-      setBookingError(e instanceof Error ? e.message : '预约失败');
+      let errorMessage = '预约失败，请稍后重试';
+      if (e instanceof Error) {
+        errorMessage = e.message;
+        if (errorMessage.includes('超时') || errorMessage.includes('LOCK_TIMEOUT')) {
+          errorMessage = '预约等待超时，当前时段较热门，请稍后重试或选择其他时段';
+        } else if (errorMessage.includes('繁忙') || errorMessage.includes('LOCK_QUEUE_FULL')) {
+          errorMessage = '系统繁忙，当前排队人数较多，请稍后再试';
+        }
+      }
+      setBookingError(errorMessage);
+    } finally {
+      setBookingLoading(false);
     }
   };
 
@@ -385,10 +398,20 @@ export default function ScheduleGrid() {
               </button>
               <button
                 onClick={handleConfirm}
-                className="flex-[2] py-3 rounded-xl bg-emerald-900 text-white font-medium hover:bg-emerald-800 transition-colors flex items-center justify-center gap-2"
+                disabled={bookingLoading}
+                className="flex-[2] py-3 rounded-xl bg-emerald-900 text-white font-medium hover:bg-emerald-800 transition-colors flex items-center justify-center gap-2 disabled:opacity-60 disabled:cursor-not-allowed"
               >
-                <Check className="w-5 h-5" />
-                确认预约
+                {bookingLoading ? (
+                  <>
+                    <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                    预约中...
+                  </>
+                ) : (
+                  <>
+                    <Check className="w-5 h-5" />
+                    确认预约
+                  </>
+                )}
               </button>
             </div>
           </div>

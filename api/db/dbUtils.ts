@@ -1,5 +1,26 @@
 import { getDb, saveDatabase } from './init.js'
 
+let inTransaction = false
+
+export function beginTransaction(): void {
+  const db = getDb()
+  db.run('BEGIN TRANSACTION')
+  inTransaction = true
+}
+
+export function commit(): void {
+  const db = getDb()
+  db.run('COMMIT')
+  inTransaction = false
+  saveDatabase()
+}
+
+export function rollback(): void {
+  const db = getDb()
+  db.run('ROLLBACK')
+  inTransaction = false
+}
+
 export function queryAll(sql: string, params: any[] = []): Record<string, any>[] {
   const db = getDb()
   const stmt = db.prepare(sql)
@@ -28,6 +49,8 @@ export function run(sql: string, params: any[] = []): number {
   const db = getDb()
   db.run(sql, params)
   const changes = db.getRowsModified()
-  saveDatabase()
+  if (!inTransaction) {
+    saveDatabase()
+  }
   return changes
 }

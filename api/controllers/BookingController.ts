@@ -1,6 +1,30 @@
 import type { Request, Response } from 'express'
 import { BookingService } from '../services/BookingService.js'
-import type { CreateBookingRequest } from '../../shared/types.js'
+import { LockTimeoutError, LockQueueFullError } from '../utils/LockManager.js'
+import type { CreateBookingRequest, CreateBatchBookingRequest } from '../../shared/types.js'
+
+function handleError(res: Response, error: unknown, defaultMessage: string): void {
+  if (error instanceof LockTimeoutError) {
+    res.status(408).json({
+      success: false,
+      message: error.message,
+      code: 'LOCK_TIMEOUT',
+    })
+    return
+  }
+  if (error instanceof LockQueueFullError) {
+    res.status(503).json({
+      success: false,
+      message: error.message,
+      code: 'LOCK_QUEUE_FULL',
+    })
+    return
+  }
+  res.status(400).json({
+    success: false,
+    message: error instanceof Error ? error.message : defaultMessage,
+  })
+}
 
 export const BookingController = {
   async getMyBookings(req: Request, res: Response): Promise<void> {
@@ -12,10 +36,22 @@ export const BookingController = {
         data: bookings,
       })
     } catch (error) {
-      res.status(400).json({
-        success: false,
-        message: error instanceof Error ? error.message : '获取预约列表失败',
+      handleError(res, error, '获取预约列表失败')
+    }
+  },
+
+  async createBatchBookings(req: Request, res: Response): Promise<void> {
+    try {
+      const userId = (req as any).currentUser.userId
+      const request = req.body as CreateBatchBookingRequest
+      const bookings = await BookingService.createBatchBookings(userId, request)
+      res.status(201).json({
+        success: true,
+        data: bookings,
+        message: `预约成功，共 ${bookings.length} 条预约`,
       })
+    } catch (error) {
+      handleError(res, error, '预约失败')
     }
   },
 
@@ -30,10 +66,7 @@ export const BookingController = {
         message: '预约成功',
       })
     } catch (error) {
-      res.status(400).json({
-        success: false,
-        message: error instanceof Error ? error.message : '预约失败',
-      })
+      handleError(res, error, '预约失败')
     }
   },
 
@@ -47,10 +80,7 @@ export const BookingController = {
         message: '取消预约成功',
       })
     } catch (error) {
-      res.status(400).json({
-        success: false,
-        message: error instanceof Error ? error.message : '取消预约失败',
-      })
+      handleError(res, error, '取消预约失败')
     }
   },
 
@@ -75,10 +105,7 @@ export const BookingController = {
         data: schedule,
       })
     } catch (error) {
-      res.status(400).json({
-        success: false,
-        message: error instanceof Error ? error.message : '获取课表失败',
-      })
+      handleError(res, error, '获取课表失败')
     }
   },
 }

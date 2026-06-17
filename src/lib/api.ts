@@ -8,6 +8,7 @@ import type {
   MemberRanking,
   CreateBookingRequest,
   CreateBookingResponse,
+  CreateBatchBookingRequest,
   AddMemberRequest,
   FamilyMember,
 } from '@/../shared/types';
@@ -58,6 +59,12 @@ export const api = {
 
   createBooking: (data: CreateBookingRequest): Promise<Booking> =>
     request('/bookings', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  createBatchBookings: (data: CreateBatchBookingRequest): Promise<Booking[]> =>
+    request('/bookings/batch', {
       method: 'POST',
       body: JSON.stringify(data),
     }),

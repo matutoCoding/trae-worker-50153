@@ -69,6 +69,16 @@ export interface CreateBookingRequest {
   endTime: string
 }
 
+export interface CreateBatchBookingRequest {
+  bookings: CreateBookingRequest[]
+}
+
+export interface CreateBatchBookingResponse {
+  success: boolean
+  bookings?: Booking[]
+  message?: string
+}
+
 export interface CreateBookingResponse {
   success: boolean
   booking?: Booking

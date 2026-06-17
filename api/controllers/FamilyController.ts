@@ -1,7 +1,31 @@
 import type { Request, Response } from 'express'
 import { FamilyService } from '../services/FamilyService.js'
 import { CreditService } from '../services/CreditService.js'
+import { LockTimeoutError, LockQueueFullError } from '../utils/LockManager.js'
 import type { AddMemberRequest } from '../../shared/types.js'
+
+function handleError(res: Response, error: unknown, defaultMessage: string): void {
+  if (error instanceof LockTimeoutError) {
+    res.status(408).json({
+      success: false,
+      message: error.message,
+      code: 'LOCK_TIMEOUT',
+    })
+    return
+  }
+  if (error instanceof LockQueueFullError) {
+    res.status(503).json({
+      success: false,
+      message: error.message,
+      code: 'LOCK_QUEUE_FULL',
+    })
+    return
+  }
+  res.status(400).json({
+    success: false,
+    message: error instanceof Error ? error.message : defaultMessage,
+  })
+}
 
 export const FamilyController = {
   async getFamily(req: Request, res: Response): Promise<void> {
@@ -13,10 +37,7 @@ export const FamilyController = {
         data: familyInfo,
       })
     } catch (error) {
-      res.status(400).json({
-        success: false,
-        message: error instanceof Error ? error.message : '获取家庭信息失败',
-      })
+      handleError(res, error, '获取家庭信息失败')
     }
   },
 
@@ -32,10 +53,7 @@ export const FamilyController = {
         message: '添加成员成功',
       })
     } catch (error) {
-      res.status(400).json({
-        success: false,
-        message: error instanceof Error ? error.message : '添加成员失败',
-      })
+      handleError(res, error, '添加成员失败')
     }
   },
 
@@ -50,10 +68,7 @@ export const FamilyController = {
         message: '移除成员成功',
       })
     } catch (error) {
-      res.status(400).json({
-        success: false,
-        message: error instanceof Error ? error.message : '移除成员失败',
-      })
+      handleError(res, error, '移除成员失败')
     }
   },
 
@@ -67,10 +82,7 @@ export const FamilyController = {
         data: transactions,
       })
     } catch (error) {
-      res.status(400).json({
-        success: false,
-        message: error instanceof Error ? error.message : '获取交易记录失败',
-      })
+      handleError(res, error, '获取交易记录失败')
     }
   },
 
@@ -100,10 +112,7 @@ export const FamilyController = {
         message: '充值成功',
       })
     } catch (error) {
-      res.status(400).json({
-        success: false,
-        message: error instanceof Error ? error.message : '充值失败',
-      })
+      handleError(res, error, '充值失败')
     }
   },
 }
