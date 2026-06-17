@@ -41,11 +41,20 @@ export interface FamilyMember {
   createdAt: string
 }
 
+export type CreditTransactionType = 'recharge' | 'consume' | 'refund'
+export type CreditTransactionSubType =
+  | 'top-up'
+  | 'booking'
+  | 'cancel'
+  | 'rollback'
+  | 'other'
+
 export interface CreditTransaction {
   id: string
   familyId: string
   userId: string
-  type: 'recharge' | 'consume' | 'refund'
+  type: CreditTransactionType
+  subType: CreditTransactionSubType
   amount: number
   balanceAfter: number
   bookingId?: string

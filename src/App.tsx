@@ -5,6 +5,7 @@ import Schedule from '@/pages/Schedule';
 import Bookings from '@/pages/Bookings';
 import Family from '@/pages/Family';
 import Statistics from '@/pages/Statistics';
+import Debug from '@/pages/Debug';
 
 export default function App() {
   return (
@@ -18,6 +19,7 @@ export default function App() {
             <Route path="/bookings" element={<Bookings />} />
             <Route path="/family" element={<Family />} />
             <Route path="/statistics" element={<Statistics />} />
+            <Route path="/debug" element={<Debug />} />
           </Routes>
         </main>
       </div>

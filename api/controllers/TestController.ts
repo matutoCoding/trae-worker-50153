@@ -77,6 +77,18 @@ export const TestController = {
       })
     }
 
+    try {
+      results.push(await testRemoveConflictAndRetry(roomId, roomName, testDate))
+    } catch (e: any) {
+      results.push({
+        name: '清除冲突后重试',
+        passed: false,
+        description: '验证多时段预约冲突后，只清除冲突时段，剩余时段可成功预约',
+        details: {},
+        error: e?.message || String(e),
+      })
+    }
+
     for (const id of testBookingsToClean) {
       try { BookingRepository.delete(id) } catch { /* ignore */ }
     }
@@ -408,6 +420,133 @@ async function testLockTimeout(): Promise<TestCaseResult> {
   } finally {
     if (firstRelease) {
       try { firstRelease() } catch { /* ignore */ }
+    }
+  }
+}
+
+async function testRemoveConflictAndRetry(
+  roomId: string,
+  roomName: string,
+  testDate: string,
+): Promise<TestCaseResult> {
+  const details: Record<string, any> = { roomId, roomName, testDate }
+  const bookingIds: string[] = []
+
+  try {
+    const user1 = 'user-1'
+    const user2 = 'user-2'
+
+    const slot1Start = `${testDate}T09:00:00`
+    const slot1End = `${testDate}T10:00:00`
+    const slot2Start = `${testDate}T10:00:00`
+    const slot2End = `${testDate}T11:00:00`
+
+    details.slot1 = '09:00-10:00'
+    details.slot2 = '10:00-11:00'
+
+    const existing = BookingRepository.findByRoomAndTimeRange(roomId, slot1Start, slot2End)
+    for (const b of existing) {
+      try { BookingRepository.delete(b.id) } catch { /* ignore */ }
+    }
+
+    const preBooking = await BookingService.createBooking(user1, {
+      roomId,
+      startTime: slot1Start,
+      endTime: slot1End,
+    })
+    bookingIds.push(preBooking.id)
+    details.preBookingBy = 'user-1'
+    details.preBookingId = preBooking.id
+
+    try {
+      await BookingService.createBatchBookings(user2, {
+        bookings: [
+          { roomId, startTime: slot1Start, endTime: slot1End },
+          { roomId, startTime: slot2Start, endTime: slot2End },
+        ],
+      })
+      details.firstAttemptSuccess = true
+      details.firstAttemptError = null
+    } catch (e: any) {
+      details.firstAttemptSuccess = false
+      details.firstAttemptError = e?.message
+      details.isBookingConflictError = e instanceof BookingConflictError
+      if (e instanceof BookingConflictError) {
+        details.conflictCount = e.conflicts.length
+        details.conflictTimes = e.conflicts.map((c) => c.startTime.slice(11, 16))
+      }
+    }
+
+    let retrySuccess = false
+    let retryError: string | null = null
+    let retryBookings: any[] = []
+
+    try {
+      const retryResult = await BookingService.createBatchBookings(user2, {
+        bookings: [
+          { roomId, startTime: slot2Start, endTime: slot2End },
+        ],
+      })
+      retrySuccess = true
+      retryBookings = retryResult
+      for (const b of retryResult) bookingIds.push(b.id)
+    } catch (e: any) {
+      retryError = e?.message
+    }
+
+    details.retrySuccess = retrySuccess
+    details.retryError = retryError
+    details.retryBookingCount = retryBookings.length
+
+    const user2Bookings = BookingRepository.findByUserId(user2).filter(
+      (b) => b.roomId === roomId && b.status === 'active'
+    )
+    details.user2ActiveBookings = user2Bookings.length
+
+    let passed = true
+    const issues: string[] = []
+
+    if (details.firstAttemptSuccess !== false) {
+      passed = false
+      issues.push('第一次提交应该因为冲突失败，但成功了')
+    }
+
+    if (!details.isBookingConflictError) {
+      passed = false
+      issues.push('第一次失败应该是 BookingConflictError 类型')
+    }
+
+    if (details.conflictCount !== 1) {
+      passed = false
+      issues.push(`应该恰好 1 个冲突时段，实际有 ${details.conflictCount} 个`)
+    }
+
+    if (!retrySuccess) {
+      passed = false
+      issues.push(`清除冲突后重试应该成功，但失败了：${retryError}`)
+    }
+
+    if (retryBookings.length !== 1) {
+      passed = false
+      issues.push(`重试后应该只创建 1 条预约，实际创建了 ${retryBookings.length} 条`)
+    }
+
+    if (details.user2ActiveBookings !== 1) {
+      passed = false
+      issues.push(`用户2最终应该有 1 条有效预约，实际有 ${details.user2ActiveBookings} 条`)
+    }
+
+    details.issues = issues
+
+    return {
+      name: '清除冲突后重试',
+      passed,
+      description: '验证多时段预约遇到冲突后，清除冲突时段再重试，只预约剩余时段',
+      details,
+    }
+  } finally {
+    for (const id of bookingIds) {
+      try { BookingRepository.delete(id) } catch { /* ignore */ }
     }
   }
 }

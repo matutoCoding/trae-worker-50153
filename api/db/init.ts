@@ -102,6 +102,7 @@ export async function initDatabase(): Promise<void> {
         family_id TEXT NOT NULL REFERENCES family_accounts(id),
         user_id TEXT NOT NULL REFERENCES family_members(id),
         type TEXT NOT NULL CHECK(type IN ('recharge', 'consume', 'refund')),
+        sub_type TEXT NOT NULL DEFAULT 'other',
         amount REAL NOT NULL,
         balance_after REAL NOT NULL,
         booking_id TEXT REFERENCES bookings(id),
@@ -114,6 +115,24 @@ export async function initDatabase(): Promise<void> {
       CREATE INDEX IF NOT EXISTS idx_bookings_family ON bookings(family_id);
       CREATE INDEX IF NOT EXISTS idx_transactions_family ON credit_transactions(family_id, created_at);
     `)
+
+    try {
+      const colCheck = db!.prepare("PRAGMA table_info(credit_transactions)")
+      let hasSubType = false
+      while (colCheck.step()) {
+        const row = colCheck.getAsObject()
+        if (row.name === 'sub_type') {
+          hasSubType = true
+          break
+        }
+      }
+      colCheck.free()
+      if (!hasSubType) {
+        db!.run("ALTER TABLE credit_transactions ADD COLUMN sub_type TEXT NOT NULL DEFAULT 'other'")
+      }
+    } catch {
+      /* migration already applied or not needed */
+    }
 
     const roomCountStmt = db.prepare('SELECT COUNT(*) as count FROM rooms')
     let roomCount = 0
@@ -155,8 +174,8 @@ export async function initDatabase(): Promise<void> {
       `)
 
       db.run(`
-        INSERT INTO credit_transactions (id, family_id, user_id, type, amount, balance_after, description, created_at) VALUES
-        ('txn-1', 'family-1', 'user-1', 'recharge', 10.0, 10.0, '初始充值 10 小时', datetime('now'))
+        INSERT INTO credit_transactions (id, family_id, user_id, type, sub_type, amount, balance_after, description, created_at) VALUES
+        ('txn-1', 'family-1', 'user-1', 'recharge', 'top-up', 10.0, 10.0, '初始充值 10 小时', datetime('now'))
       `)
     }
 

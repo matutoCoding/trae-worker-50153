@@ -7,6 +7,7 @@ function mapRowToTransaction(row: Record<string, any>): CreditTransaction {
     familyId: row.family_id as string,
     userId: row.user_id as string,
     type: row.type as CreditTransaction['type'],
+    subType: (row.sub_type as CreditTransaction['subType']) || 'other',
     amount: row.amount as number,
     balanceAfter: row.balance_after as number,
     bookingId: row.booking_id ? (row.booking_id as string) : undefined,
@@ -19,13 +20,14 @@ export const CreditRepository = {
   createTransaction(transaction: Omit<CreditTransaction, 'id' | 'createdAt'>): CreditTransaction {
     const id = `txn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
     run(
-      `INSERT INTO credit_transactions (id, family_id, user_id, type, amount, balance_after, booking_id, description, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`,
+      `INSERT INTO credit_transactions (id, family_id, user_id, type, sub_type, amount, balance_after, booking_id, description, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`,
       [
         id,
         transaction.familyId,
         transaction.userId,
         transaction.type,
+        transaction.subType || 'other',
         transaction.amount,
         transaction.balanceAfter,
         transaction.bookingId ?? null,

@@ -1,7 +1,7 @@
 import { FamilyRepository } from '../repositories/FamilyRepository.js'
 import { CreditRepository } from '../repositories/CreditRepository.js'
 import { lockManager, isLockHeldByCurrentCaller } from '../utils/LockManager.js'
-import type { CreditTransaction } from '../../shared/types.js'
+import type { CreditTransaction, CreditTransactionSubType } from '../../shared/types.js'
 
 const MAX_RETRY = 3
 
@@ -24,6 +24,7 @@ function deductCreditsCore(
   amount: number,
   bookingId: string,
   description: string,
+  subType: CreditTransactionSubType = 'booking',
 ): CreditTransaction {
   for (let attempt = 0; attempt < MAX_RETRY; attempt++) {
     const account = FamilyRepository.findAccountById(familyId)
@@ -47,6 +48,7 @@ function deductCreditsCore(
         familyId,
         userId,
         type: 'consume',
+        subType,
         amount,
         balanceAfter: newBalance,
         bookingId,
@@ -64,6 +66,7 @@ function refundCreditsCore(
   amount: number,
   bookingId: string,
   description: string,
+  subType: CreditTransactionSubType = 'cancel',
 ): CreditTransaction {
   for (let attempt = 0; attempt < MAX_RETRY; attempt++) {
     const account = FamilyRepository.findAccountById(familyId)
@@ -83,6 +86,7 @@ function refundCreditsCore(
         familyId,
         userId,
         type: 'refund',
+        subType,
         amount,
         balanceAfter: newBalance,
         bookingId,
@@ -99,6 +103,7 @@ function rechargeCreditsCore(
   userId: string,
   amount: number,
   description: string,
+  subType: CreditTransactionSubType = 'top-up',
 ): CreditTransaction {
   for (let attempt = 0; attempt < MAX_RETRY; attempt++) {
     const account = FamilyRepository.findAccountById(familyId)
@@ -120,6 +125,7 @@ function rechargeCreditsCore(
         familyId,
         userId,
         type: 'recharge',
+        subType,
         amount,
         balanceAfter: newBalance,
         description,
@@ -139,6 +145,7 @@ export const CreditService = {
     amount: number,
     bookingId: string,
     description: string,
+    subType?: CreditTransactionSubType,
   ): Promise<CreditTransaction> {
     if (amount <= 0) {
       throw new Error('扣减额度必须大于 0')
@@ -147,12 +154,12 @@ export const CreditService = {
     const lockKey = `family:credits:${familyId}`
 
     if (isLockHeldByCurrentCaller(lockKey)) {
-      return deductCreditsCore(familyId, userId, amount, bookingId, description)
+      return deductCreditsCore(familyId, userId, amount, bookingId, description, subType)
     }
 
     return lockManager.runWithLock(
       lockKey,
-      () => deductCreditsCore(familyId, userId, amount, bookingId, description),
+      () => deductCreditsCore(familyId, userId, amount, bookingId, description, subType),
       12000,
     )
   },
@@ -163,6 +170,7 @@ export const CreditService = {
     amount: number,
     bookingId: string,
     description: string,
+    subType?: CreditTransactionSubType,
   ): Promise<CreditTransaction> {
     if (amount <= 0) {
       throw new Error('退回额度必须大于 0')
@@ -171,12 +179,12 @@ export const CreditService = {
     const lockKey = `family:credits:${familyId}`
 
     if (isLockHeldByCurrentCaller(lockKey)) {
-      return refundCreditsCore(familyId, userId, amount, bookingId, description)
+      return refundCreditsCore(familyId, userId, amount, bookingId, description, subType)
     }
 
     return lockManager.runWithLock(
       lockKey,
-      () => refundCreditsCore(familyId, userId, amount, bookingId, description),
+      () => refundCreditsCore(familyId, userId, amount, bookingId, description, subType),
       12000,
     )
   },
@@ -186,6 +194,7 @@ export const CreditService = {
     userId: string,
     amount: number,
     description: string,
+    subType?: CreditTransactionSubType,
   ): Promise<CreditTransaction> {
     if (amount <= 0) {
       throw new Error('充值额度必须大于 0')
@@ -194,12 +203,12 @@ export const CreditService = {
     const lockKey = `family:credits:${familyId}`
 
     if (isLockHeldByCurrentCaller(lockKey)) {
-      return rechargeCreditsCore(familyId, userId, amount, description)
+      return rechargeCreditsCore(familyId, userId, amount, description, subType)
     }
 
     return lockManager.runWithLock(
       lockKey,
-      () => rechargeCreditsCore(familyId, userId, amount, description),
+      () => rechargeCreditsCore(familyId, userId, amount, description, subType),
       12000,
     )
   },

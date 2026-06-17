@@ -116,4 +116,24 @@ export const api = {
 
   getMemberRanking: (startDate: string, endDate: string): Promise<MemberRanking[]> =>
     request(`/statistics/ranking?startDate=${startDate}&endDate=${endDate}`),
+
+  runConcurrencyTests: (): Promise<ConcurrencyTestResult> =>
+    request('/test/concurrency'),
 };
+
+export interface ConcurrencyTestResult {
+  allPassed: boolean;
+  total: number;
+  passed: number;
+  failed: number;
+  testDate: string;
+  results: ConcurrencyTestCaseResult[];
+}
+
+export interface ConcurrencyTestCaseResult {
+  name: string;
+  passed: boolean;
+  description: string;
+  details: Record<string, any>;
+  error?: string;
+}

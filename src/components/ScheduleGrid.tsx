@@ -36,7 +36,7 @@ function getMonday(date: Date): Date {
 const weekDayNames = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
 
 export default function ScheduleGrid() {
-  const { rooms, selectedSlots, toggleSelectedSlot, clearSelectedSlots, user, removeSelectedSlots } = useAppStore();
+  const { rooms, selectedSlots, toggleSelectedSlot, clearSelectedSlots, user, removeSelectedSlots, setFamilyInfo } = useAppStore();
   const [weekStart, setWeekStart] = useState<Date>(getMonday(new Date()));
   const [scheduleData, setScheduleData] = useState<Map<string, ScheduleSlot>>(new Map());
   const [loading, setLoading] = useState(false);
@@ -142,48 +142,97 @@ export default function ScheduleGrid() {
   const totalMinutes = selectedSlots.length * SLOT_MINUTES;
   const totalHours = (totalMinutes / 60).toFixed(1);
 
-  const handleConfirm = async () => {
-    setBookingError(null);
-    setConflictInfos([]);
-    setNoRetrySlots(false);
+  const buildBatchBookings = (slots: typeof selectedSlots) => {
+    const byRoom = new Map<string, typeof selectedSlots>();
+    for (const slot of slots) {
+      const arr = byRoom.get(slot.roomId) ?? [];
+      arr.push(slot);
+      byRoom.set(slot.roomId, arr);
+    }
+    const batchBookings: { roomId: string; startTime: string; endTime: string }[] = [];
+
+    byRoom.forEach((roomSlots, roomId) => {
+      const sorted = [...roomSlots].sort((a, b) => a.startTime.localeCompare(b.startTime));
+      let currentStart = sorted[0];
+      let prevEnd = sorted[0];
+
+      const flush = () => {
+        batchBookings.push({
+          roomId,
+          startTime: `${currentStart.date}T${currentStart.startTime}:00`,
+          endTime: `${prevEnd.date}T${prevEnd.endTime}:00`,
+        });
+      };
+
+      for (let i = 1; i < sorted.length; i++) {
+        const slot = sorted[i];
+        if (slot.date === prevEnd.date && slot.startTime === prevEnd.endTime) {
+          prevEnd = slot;
+        } else {
+          flush();
+          currentStart = slot;
+          prevEnd = slot;
+        }
+      }
+      flush();
+    });
+
+    return batchBookings;
+  };
+
+  const fetchWeekSchedule = async () => {
+    const weekStartStr = weekStart.toISOString().split('T')[0];
+    const end = new Date(weekStart);
+    end.setDate(end.getDate() + 7);
+    const weekEndStr = end.toISOString().split('T')[0];
+    try {
+      const slotMap = new Map<string, ScheduleSlot>();
+      for (const room of rooms) {
+        const list = await api.getWeekSchedule(room.id, weekStartStr, weekEndStr);
+        for (const s of list) {
+          slotMap.set(s.id, s);
+        }
+      }
+      setScheduleData(slotMap);
+    } catch (e) {
+      console.error('刷新排期失败', e);
+    }
+  };
+
+  const refreshFamilyInfo = async () => {
+    try {
+      const info = await api.getFamilyInfo();
+      setFamilyInfo(info);
+    } catch (e) {
+      console.error('刷新家庭信息失败', e);
+    }
+  };
+
+  const submitBookings = async (slots: typeof selectedSlots) => {
+    if (slots.length === 0) {
+      return { success: false, error: '没有可预约的时段' };
+    }
+
+    const batchBookings = buildBatchBookings(slots);
+    if (batchBookings.length === 0) {
+      return { success: false, error: '没有可预约的时段' };
+    }
+
     setBookingLoading(true);
     try {
-      const batchBookings: { roomId: string; startTime: string; endTime: string }[] = [];
-
-      selectedByRoom.forEach((slots, roomId) => {
-        const sorted = [...slots].sort((a, b) => a.startTime.localeCompare(b.startTime));
-        let currentStart = sorted[0];
-        let prevEnd = sorted[0];
-
-        const flush = () => {
-          batchBookings.push({
-            roomId,
-            startTime: `${currentStart.date}T${currentStart.startTime}:00`,
-            endTime: `${prevEnd.date}T${prevEnd.endTime}:00`,
-          });
-        };
-
-        for (let i = 1; i < sorted.length; i++) {
-          const slot = sorted[i];
-          if (slot.date === prevEnd.date && slot.startTime === prevEnd.endTime) {
-            prevEnd = slot;
-          } else {
-            flush();
-            currentStart = slot;
-            prevEnd = slot;
-          }
-        }
-        flush();
-      });
-
       await api.createBatchBookings({ bookings: batchBookings });
-
       clearSelectedSlots();
       setShowDrawer(false);
-      window.location.reload();
+      setBookingError(null);
+      setConflictInfos([]);
+      setNoRetrySlots(false);
+      fetchWeekSchedule();
+      refreshFamilyInfo();
+      return { success: true };
     } catch (e) {
       const apiErr = e as ApiError;
       let errorMessage = '预约失败，请稍后重试';
+      let conflicts: BookingConflictInfo[] = [];
 
       if (apiErr.code === 'LOCK_TIMEOUT') {
         errorMessage = '预约等待超时，当前时段较热门，请稍后重试或选择其他时段';
@@ -192,7 +241,7 @@ export default function ScheduleGrid() {
       } else if (apiErr.code === 'BOOKING_CONFLICT') {
         errorMessage = '部分时段已被他人抢先预约，请查看下方详情后调整选择';
         if (apiErr.conflicts && apiErr.conflicts.length > 0) {
-          setConflictInfos(apiErr.conflicts);
+          conflicts = apiErr.conflicts;
         }
       } else if (apiErr.code === 'CREDIT_INSUFFICIENT') {
         const cur = apiErr.currentBalance ?? 0;
@@ -202,9 +251,23 @@ export default function ScheduleGrid() {
         errorMessage = apiErr.message;
       }
 
-      setBookingError(errorMessage);
+      return { success: false, error: errorMessage, conflicts };
     } finally {
       setBookingLoading(false);
+    }
+  };
+
+  const handleConfirm = async () => {
+    setBookingError(null);
+    setConflictInfos([]);
+    setNoRetrySlots(false);
+
+    const result = await submitBookings(selectedSlots);
+    if (!result.success) {
+      setBookingError(result.error || '预约失败');
+      if (result.conflicts && result.conflicts.length > 0) {
+        setConflictInfos(result.conflicts);
+      }
     }
   };
 
@@ -222,22 +285,41 @@ export default function ScheduleGrid() {
     });
   };
 
-  const handleRemoveConflictsAndRetry = async () => {
-    const toRemove = getSlotsOverlappingConflicts();
-    if (toRemove.length === 0) return;
+  const getNonConflictingSlots = () => {
+    if (conflictInfos.length === 0) return [...selectedSlots];
+    return selectedSlots.filter((slot) => {
+      const slotStart = new Date(`${slot.date}T${slot.startTime}:00`).getTime();
+      const slotEnd = new Date(`${slot.date}T${slot.endTime}:00`).getTime();
+      return !conflictInfos.some((c) => {
+        if (c.roomId !== slot.roomId) return false;
+        const cStart = new Date(c.startTime).getTime();
+        const cEnd = new Date(c.endTime).getTime();
+        return slotStart < cEnd && slotEnd > cStart;
+      });
+    });
+  };
 
-    if (toRemove.length >= selectedSlots.length) {
+  const handleRemoveConflictsAndRetry = async () => {
+    const remainingSlots = getNonConflictingSlots();
+
+    if (remainingSlots.length === 0) {
       setNoRetrySlots(true);
       setBookingError('清除冲突后已无可预约时段，请关闭后重新选择其他时段');
       return;
     }
 
-    removeSelectedSlots(toRemove);
+    removeSelectedSlots(getSlotsOverlappingConflicts());
     setConflictInfos([]);
     setNoRetrySlots(false);
     setBookingError(null);
 
-    setTimeout(() => handleConfirm(), 50);
+    const result = await submitBookings(remainingSlots);
+    if (!result.success) {
+      setBookingError(result.error || '重试失败');
+      if (result.conflicts && result.conflicts.length > 0) {
+        setConflictInfos(result.conflicts);
+      }
+    }
   };
 
   return (

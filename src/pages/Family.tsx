@@ -9,10 +9,13 @@ import {
   ArrowDownLeft,
   RefreshCcw,
   CreditCard,
+  CalendarClock,
+  XCircle,
+  Undo2,
 } from 'lucide-react';
 import { useAppStore } from '@/stores/useAppStore';
 import { api } from '@/lib/api';
-import type { CreditTransaction } from '@/../shared/types';
+import type { CreditTransaction, CreditTransactionSubType } from '@/../shared/types';
 
 export default function Family() {
   const { familyInfo, setFamilyInfo } = useAppStore();
@@ -82,21 +85,35 @@ export default function Family() {
     }
   };
 
-  const getTxnIcon = (type: CreditTransaction['type']) => {
+  const getTxnIcon = (type: CreditTransaction['type'], subType?: CreditTransactionSubType) => {
     if (type === 'recharge') return ArrowUpRight;
-    if (type === 'refund') return RefreshCcw;
+    if (type === 'refund') {
+      if (subType === 'cancel') return Undo2;
+      if (subType === 'rollback') return XCircle;
+      return RefreshCcw;
+    }
+    if (subType === 'booking') return CalendarClock;
     return ArrowDownLeft;
   };
 
-  const getTxnColor = (type: CreditTransaction['type']) => {
+  const getTxnColor = (type: CreditTransaction['type'], subType?: CreditTransactionSubType) => {
     if (type === 'recharge') return 'text-emerald-600 bg-emerald-50';
-    if (type === 'refund') return 'text-sky-600 bg-sky-50';
-    return 'text-amber-600 bg-amber-50';
+    if (type === 'refund') {
+      if (subType === 'rollback') return 'text-rose-600 bg-rose-50';
+      return 'text-sky-600 bg-sky-50';
+    }
+    if (subType === 'booking') return 'text-amber-600 bg-amber-50';
+    return 'text-gray-600 bg-gray-50';
   };
 
-  const getTxnLabel = (type: CreditTransaction['type']) => {
+  const getTxnLabel = (type: CreditTransaction['type'], subType?: CreditTransactionSubType) => {
     if (type === 'recharge') return '充值';
-    if (type === 'refund') return '退款';
+    if (type === 'refund') {
+      if (subType === 'cancel') return '退订返还';
+      if (subType === 'rollback') return '失败回滚';
+      return '退款';
+    }
+    if (subType === 'booking') return '预约扣减';
     return '消费';
   };
 
@@ -186,30 +203,40 @@ export default function Family() {
       <div>
         <h2 className="text-lg font-bold text-gray-900 mb-4">额度流水</h2>
         {transactions.length > 0 ? (
-          <div className="bg-white rounded-2xl border border-gray-100 divide-y divide-gray-50">
+          <div className="relative bg-white rounded-2xl border border-gray-100 p-1 pl-8">
+            <div className="absolute left-6 top-6 bottom-6 w-px bg-gray-100"></div>
             {transactions
               .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
-              .map((txn) => {
-                const Icon = getTxnIcon(txn.type);
+              .map((txn, idx) => {
+                const Icon = getTxnIcon(txn.type, txn.subType);
+                const isLast = idx === transactions.length - 1;
                 return (
-                  <div key={txn.id} className="flex items-center gap-4 p-4">
-                    <div className={`w-10 h-10 rounded-xl flex items-center justify-center ${getTxnColor(txn.type)}`}>
-                      <Icon className="w-5 h-5" />
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="font-medium text-gray-900 truncate">{txn.description}</p>
-                      <p className="text-sm text-gray-500">
-                        {new Date(txn.createdAt).toLocaleString('zh-CN')}
-                      </p>
-                    </div>
-                    <div className="text-right">
-                      <p className={`font-bold ${txn.type === 'consume' ? 'text-amber-600' : 'text-emerald-600'}`}>
-                        {txn.type === 'consume' ? '-' : '+'}
-                        {txn.amount}
-                      </p>
-                      <p className="text-xs text-gray-500">
-                        余额 {txn.balanceAfter} · {getTxnLabel(txn.type)}
-                      </p>
+                  <div key={txn.id} className={`relative py-4 ${isLast ? '' : 'border-b border-gray-50'}`}>
+                    <div className={`absolute -left-[30px] top-5 w-4 h-4 rounded-full border-2 border-white shadow-sm ${getTxnColor(txn.type, txn.subType).replace('bg-', 'bg-').replace('text-', '')}`} style={{ backgroundColor: txn.type === 'recharge' ? '#10b981' : txn.subType === 'rollback' ? '#f43f5e' : txn.subType === 'cancel' || txn.type === 'refund' ? '#0284c7' : '#d97706' }}></div>
+                    <div className="flex items-start gap-4">
+                      <div className={`w-10 h-10 rounded-xl flex items-center justify-center ${getTxnColor(txn.type, txn.subType)}`}>
+                        <Icon className="w-5 h-5" />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2">
+                          <p className="font-medium text-gray-900 truncate">{txn.description}</p>
+                          <span className="text-xs px-2 py-0.5 rounded-full bg-gray-50 text-gray-500 font-medium whitespace-nowrap">
+                            {getTxnLabel(txn.type, txn.subType)}
+                          </span>
+                        </div>
+                        <p className="text-sm text-gray-500 mt-0.5">
+                          {new Date(txn.createdAt).toLocaleString('zh-CN')}
+                        </p>
+                      </div>
+                      <div className="text-right">
+                        <p className={`font-bold ${txn.type === 'consume' ? 'text-amber-600' : 'text-emerald-600'}`}>
+                          {txn.type === 'consume' ? '-' : '+'}
+                          {txn.amount}
+                        </p>
+                        <p className="text-xs text-gray-500">
+                          余额 {txn.balanceAfter}
+                        </p>
+                      </div>
                     </div>
                   </div>
                 );
